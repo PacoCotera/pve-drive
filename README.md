@@ -1,150 +1,167 @@
-# Proxmox VM archive on Google Shared Drive
+# pve-drive
 
-For routine administration, use the three commands in [ADMIN.md](ADMIN.md): `upload VMID`, `list`, and `restore VMID`. Upload moves the VM off the server after verification; restore automatically selects its latest complete archive. These commands clean up successful local staging by default (`--keep-local` retains it). The detailed sections below describe archive formats and advanced commands.
+Move Proxmox QEMU VMs to Google Shared Drive using rclone, and restore them by VMID. Version **0.4.3**.
 
-`pve_drive.py` is a Python 3 command-line tool using Proxmox and rclone. Default mode uses `vzdump` / `qmrestore` for the current VM state. `--format native-qcow2` preserves supported internal disk snapshot histories using complete QCOW2 files and the full Proxmox configuration. It supports QEMU VMs, not LXC containers or Proxmox Backup Server repositories. Python uses only its standard library. Check the installed version with `./pve_drive.py --version` (0.4.2).
+The routine commands are **upload**, **list**, and **restore**. Internal backup IDs and archive formats are handled automatically. [ADMIN.md](ADMIN.md) is the short admin guide.
 
-## Native QCOW2 snapshots (directory storage)
+## Install and update
 
-An example VM configuration has one standalone QCOW2 disk on directory storage and one internal disk-only snapshot, `before-change`. This is the native mode's supported case. It archives the entire QCOW2 file without `qemu-img convert`, plus `vm.conf` including the `[before-change]` section and parent relationships. See [QEMU's internal snapshot format](https://www.qemu.org/docs/master/interop/qcow2.html). This is a custom archive restored by this script, not a VMA backup importable through the Proxmox backup UI.
-
-Copy the updated single Python file to the server. Start by retaining the original VM:
+Run on the Proxmox server. The repository is private: use a GitHub personal access token at the HTTPS password prompt, not your account password. A fine-grained token limited to this repository with Contents read-only is sufficient for cloning/pulling. See [GitHub authentication instructions](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
 
 ```bash
-./pve_drive.py --remote gdrive:pve-archive --source pve-site-a \
-  archive 100 --format native-qcow2 --keep-vm --cleanup-local
-
-./pve_drive.py --remote gdrive:pve-archive --source pve-site-a list
-```
-
-Use the printed backup ID and a free VMID for a restore test. Replace `BACKUP_ID` below. Your `destination-dir` is configured as directory storage and is a candidate target if enabled for disk images on this node:
-
-```bash
-./pve_drive.py --remote gdrive:pve-archive --source pve-site-a \
-  restore BACKUP_ID 200 --storage destination-dir --unique --cleanup-local
-qm listsnapshot 200
-```
-
-The script detects native format automatically during restore and verification. It checks every downloaded disk hash and QCOW2 snapshot table, reserves the destination VMID using `qm create` with a create lock, allocates new disk files via `pvesm alloc`, copies the original QCOW2 bytes, remaps disk references in every configuration section, and checks that Proxmox recognizes the snapshot names before unlocking. The VM stays stopped with current `onboot=0`. `--unique` remaps MAC addresses consistently across the current and snapshot configurations. Guest static IPs and SMBIOS identity are not changed. Inspect network configuration before booting a test clone.
-
-Once a real restore and snapshot rollback have been tested, native archive can use `--delete-vm` instead of `--keep-vm`. It requires no `--allow-snapshot-loss`: native mode preserves supported snapshots. Backup deletion remains gated by full remote read-back, local checksums, disk checks, and rechecking the source configuration and disk hashes. Normal operation must still have exclusive access to the VM.
-
-Native mode currently requires directory storage, VM-owned standalone QCOW2 files, and the same disk attachments in every snapshot. It rejects backing chains, external data files, encrypted QCOW2, raw disks, saved RAM state, cloud-init disks, and unsupported configuration resources. It compares the complete internal snapshot name set against the Proxmox sections for every disk. Any unsupported case aborts; there is no fallback that discards history. Existing `vzdump` archives remain readable.
-
-**Space:** QCOW2 files with snapshots can exceed the guest disk capacity. Native upload retains that file length and is uncompressed. Archive staging conservatively requires the full file length plus 1 GiB. Restore needs a staging copy plus a destination copy; on the same filesystem allow approximately twice the file length plus headroom. A failed destination-space check retains the downloaded staging files. `--cleanup-local` removes staging only after successful completion, so repeat tests do not accumulate another archive copy each time. Sequential copying creates sparse output only for buffers read as zero. It does not use reflinks, copy offloading, or filesystem hole reporting. Space checks do not assume sparse savings.
-
-On native restore failure, keep the create lock while inspecting the partial VM and the staging directory's `restore-state.json`. That file records allocated destination volumes, which may not yet be attached to the placeholder VM. Do not merely unlock and start a partial restore. No automatic cleanup of partially allocated disks is attempted. The remote archive and downloaded files remain available. Native restore writes the complete Proxmox configuration after reserving the VMID; as with archive, no other task or administrator should change that VM during the operation.
-
-## Install and update from Git
-
-```bash
-git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive
-cd /opt/pve-drive
+git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive &&
+cd /opt/pve-drive &&
 sudo ./install.sh
 ```
 
-Update with `cd /opt/pve-drive && git pull --ff-only && sudo ./install.sh`.
-The installer places the executable at `/usr/local/sbin/pve-drive`, preserves an old directory at that path under a timestamped backup name, and blocks upgrades during active operations. Source and installed executable are separate. See [ADMIN.md](ADMIN.md) for normal command usage.
+Update after any active upload/restore finishes:
 
-## Dependencies and rclone configuration
+```bash
+cd /opt/pve-drive && git pull --ff-only && sudo ./install.sh
+```
 
-Install from Git as above. Install dependencies and configure rclone on the Proxmox node:
+The installer places the command at `/usr/local/sbin/pve-drive`. An old directory at that path is preserved under `pve-drive.previous-<timestamp>-<suffix>`. Installation is atomic and blocked while a pve-drive operation is running. VM storage, staging directories, and rclone credentials are not relocated. Installation does not install dependencies.
+
+Requirements: Linux, root, Python 3, rclone, and the normal Proxmox tools (`pvesh`, `qm`, `pvesm`, `vzdump`, `qmrestore`, `qemu-img`, `zstd`). Git is needed for updates. Python uses only its standard library. LXC and Proxmox Backup Server repositories are not supported.
+
+## Configure rclone once
 
 ```bash
 apt-get update
-apt-get install python3 rclone zstd
+apt-get install git python3 rclone zstd
 rclone config
 ```
 
-In rclone config, create a Google Drive remote called `gdrive`, authenticate an account with access to your Shared Drive, and select that Shared Drive when prompted. Use your own Google OAuth client ID; rclone documents that its shared client is being retired during 2026. A service account is also possible if it has appropriate Shared Drive membership. This tool uses the existing rclone configuration; it does not provision Google credentials.
-
-Shared Drives use the `team_drive` setting. `shared_with_me` is a different feature. See [rclone's Google Drive setup](https://rclone.org/drive/) for authentication and Shared Drive configuration. Use a dedicated folder and restrict who can modify it. If you use rclone crypt over that folder, point this script at the crypt remote and preserve its configuration and encryption keys separately.
-
-Confirm access under the same root account used by the script:
+Create a Google Drive remote called `gdrive`, authenticate an account with access to your Shared Drive, and select the Shared Drive. Use your own OAuth client ID; see [rclone's Drive documentation](https://rclone.org/drive/). Shared Drives use `team_drive`; `shared_with_me` is a different feature. A service account also works if granted appropriate membership.
 
 ```bash
 rclone lsd gdrive:
 rclone mkdir gdrive:pve-archive
 ```
 
-The default configuration path is `/root/.config/rclone/rclone.conf`. Override it with `--rclone-config PATH` before the subcommand. `--work-dir PATH` selects local staging storage; the default is `/var/lib/vz/pve-drive`. Allow enough free staging space for the compressed backup, and enough target storage for all restored disks. Backup size cannot reliably be predicted from compressed guest data; a full staging filesystem causes an error before deletion.
+Default rclone config: `/root/.config/rclone/rclone.conf`. Override using `--rclone-config PATH`. A crypt remote can be used; preserve its configuration and encryption keys separately.
 
-## Multiple servers sharing one Drive
+## Routine commands
 
-Give each server a unique, stable `--source` label, for example `pve-site-b` and `lab-pve1`. Every server can use the same `--remote gdrive:pve-archive`. Labels are explicit because separate installations can have identical node hostnames. Choose distinct labels across all installations writing to this folder; labels are case-sensitive. The tool does not automatically register or enforce ownership of a label.
+Global options (`--remote`, `--source`, `--work-dir`, `--rclone-config`) go **before** the command.
 
-The remote layout is:
+Upload VM 100, verify the archive, and delete the original VM and its disks:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100
+```
+
+Add `--keep-vm` for a test upload: the VM remains on the server, stopped. Supported snapshot history is automatically included; unsupported snapshot layouts abort rather than silently discarding history.
+
+List the latest complete cloud archive for each VM:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a list
+```
+
+Columns: VMID, name, format, snapshot names, and UTC archive date. Incomplete uploads are ignored. Use `list --all-versions` only when older versions or internal backup IDs are needed.
+
+Restore VM 100 using its latest complete archive, original VMID and original storage:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
+```
+
+Restore source VM 100 under a different VMID and storage:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  restore 100 --target-vmid 200 --storage destination-dir --unique
+```
+
+Run restore on the destination PVE, but keep the **original source label**. Existing VMIDs are refused. Restored VMs stay stopped with current `onboot=0`. Inspect hardware and networking before starting. `--unique` changes MAC addresses consistently, including snapshot sections for native archives; it does not change guest static IPs or SMBIOS identity. The cloud backup remains after restore.
+
+Latest means the newest UTC timestamp in a complete backup ID. A bad latest manifest causes an error, not silent fallback to an older copy. Native archives that originally span multiple storage IDs require an explicit destination `--storage` override.
+
+Successful upload and restore remove their staging files by default. Add `--keep-local` to retain them. Failures retain recovery files. No automatic remote pruning is performed: the remote archive may be the only remaining copy of a deleted VM.
+
+## Source server identity
+
+Assign each server a unique stable label such as `pve-site-a` or `pve-site-b`; do not reuse labels across independent servers with the same hostname. The manifest records both this label and the actual Proxmox node name, along with VMID, name/configuration, timestamp, and hashes. Label ownership is not automatically enforced.
 
 ```text
 pve-archive/sources/
+  pve-site-a/100/<timestamp-uuid>/
   pve-site-b/100/<timestamp-uuid>/
-  lab-pve1/100/<timestamp-uuid>/
 ```
 
-Each backup contains the source label, actual Proxmox node name, original VMID, VM name/configuration, timestamp, and checksum. `list` prints the selected source, backup ID, size, and VM name. VM 100 on two independent servers therefore has separate folders. Run `rclone lsf gdrive:pve-archive/sources --dirs-only` to see source folders, then select a source with `list`.
+See source folders with `rclone lsf gdrive:pve-archive/sources --dirs-only`. The tool does not SSH to nodes. Upload must run on the VM's owning node. A migrated VM may have older archives under another source label.
 
-For archiving, the source identifies the server being archived, and the command must run on the VM's owning node. For listing, verification, or restoration, the source selects the **original** server's backups. You can restore an `pve-site-b` backup while running on `lab-pve1`: keep `--source pve-site-b`, choose a free destination VMID, and specify destination storage. The script does not SSH to nodes or route commands to another node. In a cluster, the same VM may have archives under different source labels if it was migrated between backups.
+## Archive formats and scope
 
-Backups made with the earlier script have no source folder. Use `--legacy-layout` in place of `--source pve-site-b` to list, verify, or restore those backups. New archives always require a source. Legacy backups cannot reliably identify the original server and are not moved automatically.
+`upload` chooses:
 
-## Commands
+- **No snapshots:** zstd-compressed VMA using `vzdump`, restored with `qmrestore`.
+- **Snapshots present:** native QCOW2 files plus the full VM configuration, including snapshot sections and parent relationships. Native archives are restored by this script, not through the Proxmox VMA backup UI.
 
-First exercise the workflow on a disposable VM using `--keep-vm`, and test restoration to a spare VMID:
+Native mode currently supports VM-owned standalone QCOW2 files on directory storage, with identical disk attachments across all snapshot sections. It checks the internal snapshot table against the Proxmox snapshot names for every disk. It rejects backing chains, external data files, encryption, saved RAM, raw disks, cloud-init disks, and changing disk attachments between snapshots. See [QEMU's internal snapshot format](https://www.qemu.org/docs/master/interop/qcow2.html).
+
+Native copying reads every byte sequentially, creates holes only for buffers actually read as zero, flushes the destination, and verifies SHA-256. It does not convert QCOW2 files or use reflinks, copy offloading, or filesystem hole reporting.
+
+Both modes reject protected/template VMs, unsupported existing locks, pending configuration, HA/replication membership, unused/excluded data disks, host passthrough, physical CD-ROM devices, custom QEMU arguments, hooks, and external cloud-init snippets. A matching backup lock is accepted only by the explicit native local-copy resume flow.
+
+Storage ISO references are allowed, but ISO contents are not archived. References are retained in the saved configuration; VMA manifests additionally record `external_media`. Reattach or eject unavailable ISOs before starting a restored VM. Empty CD-ROM drives are accepted. Standard cloud-init drives are accepted by VMA mode only.
+
+The archive does not package host bridges, storage definitions, Proxmox firewall files, cluster permissions, HA settings, or external resources. Byte verification is not a guest boot/application health test. Perform a real restore and snapshot rollback test before relying on deletion of the original.
+
+## Space and maintenance requirements
+
+Default staging: `/var/lib/vz/pve-drive`. Set `--work-dir PATH` before the command to use another filesystem. QCOW2 files containing snapshots can exceed the guest disk capacity. Native archives are uncompressed. New native staging requires the full file length plus 1 GiB; restore needs both a download and a destination copy. On one filesystem, allow approximately twice the archive size plus headroom. Sparse savings are not assumed. Failed space checks may leave downloaded files for inspection.
+
+Use an exclusive maintenance window. Do not start, modify, migrate, unlock, or replace the VM during an operation. The tool serializes its own tasks on each node and uses a Proxmox backup lock. It does not prevent administrators from bypassing locks. In VMA mode, Proxmox holds its normal backup lock during vzdump, followed by the tool's upload lock. In native mode the tool holds a backup lock before copying.
+
+For VMA backups, site defaults and hooks in `/etc/vzdump.conf` still apply. All upload paths require successful full [rclone read-back verification](https://rclone.org/commands/rclone_check/) and completion-marker publication before VM deletion. Deletion itself is not transactional: storage errors can leave a partial deletion, with recovery copies retained.
+
+## Resume a failed native local copy
+
+This is limited to a failed copy **before manifest creation/upload**:
 
 ```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-b archive 100 --keep-vm
-pve-drive --remote gdrive:pve-archive --source pve-site-b list
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm
 ```
 
-Archive and delete a VM after verified upload:
+Use your exact staging path. Leave the VM stopped with its backup lock; **do not unlock first**. Resume requires the saved and current full configuration to match, replaces failed copies in the same directory, and performs all normal verification. It refuses stages with a manifest or completion marker. It does not create a second staging directory, but rewriting still requires enough filesystem space. It is not general upload/download resumption.
+
+A checksum failure writes sizes, timestamps, and before/after source and destination SHA-256 values to `copy-mismatch.json`. A mismatch stops the operation; it is never bypassed. Sequential copying was introduced after a real accelerated-copy mismatch. The cause of that host mismatch has not been established.
+
+## Other failure recovery
+
+The console prints the staging path. Failed uploads may leave remote directories without `COMPLETE`; listing and automatic restore ignore them. Rclone retries transient errors within an operation. A fresh upload uses a new staging directory/version rather than trusting an interrupted one.
+
+First verify that no operation remains active, then inspect `qm status VMID`, `qm config VMID`, and recovery files. To abandon a failed operation, manually unlock only after inspection and after all related tasks have stopped. Do not apply that unlock step when using `--resume`, which requires the backup lock.
+
+Interrupted native restores can leave a create-locked placeholder VM and allocated disks. `restore-state.json` in staging records allocations; some disks may not yet be attached to the placeholder. Inspect before cleanup; do not just unlock and start it. The tool never automatically deletes those partial allocations. Interrupted VMA restores can also leave partial VMs. Restore refuses to overwrite either case. If only final cleanup fails, the operation may already have succeeded; inspect state before retrying.
+
+Remote immutability is a tool convention, not a Google permission guarantee. The completion checksum is not a signature; control who can write to the remote. Local and remote partial copies can be removed manually after inspection.
+
+## Advanced commands
+
+`archive` explicitly selects VMA or native mode and requires `--keep-vm` or `--delete-vm`. Unlike routine upload, it retains local staging by default; `--cleanup-local` removes staging after success. VMA archive does not contain snapshot history, and deleting a VM with snapshots in that mode requires `--allow-snapshot-loss`. Routine `upload` never sets that flag.
+
+Use `list --all-versions` to obtain a backup ID for explicit verification or an older restore:
 
 ```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-b archive 100 --delete-vm --cleanup-local
+pve-drive --remote gdrive:pve-archive --source pve-site-a verify BACKUP_ID --cleanup-local
+pve-drive --remote gdrive:pve-archive --source pve-site-a restore BACKUP_ID 200 --storage destination-dir --unique
 ```
 
-`--delete-vm` explicitly authorizes `qm destroy`, including removal of VM disks. `--purge 1` removes related Proxmox job references. Local recovery files remain by default; `--cleanup-local` removes only the staging directory created by this successful operation. The script never automatically deletes remote backups.
+`verify` retains downloads unless `--cleanup-local` is supplied. Explicit restores use the same successful-cleanup default as routine restore. Old `move-to-cloud`/`move-from-cloud` command aliases remain available. `--legacy-layout` replaces `--source` for reading old archives made before source directories existed; it is not allowed for uploads.
 
-Copy the exact backup ID from `list` into the following commands (the ID below is an example):
+## Help and validation
 
 ```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-b verify \
-  100/20260905T010000Z-0123456789abcdef0123456789abcdef --cleanup-local
-
-pve-drive --remote gdrive:pve-archive --source pve-site-b restore \
-  100/20260905T010000Z-0123456789abcdef0123456789abcdef \
-  200 --storage local-lvm --unique --cleanup-local
+pve-drive --help
+pve-drive upload --help
+pve-drive list --help
+pve-drive restore --help
+pve-drive archive --help
+pve-drive verify --help
 ```
 
-Restore can use the original VMID if free, or a new one. It refuses an existing VMID across the cluster and never passes `--force` to `qmrestore`. `--unique` generates new MAC addresses; omit it when preserving network identity. Restored VMs remain stopped with `onboot=0`; inspect bridges, storage, guest networking, and hardware before `qm start 200`. Remote backups remain available after restore. There is deliberately no automatic retention pruning: an archive may be the only copy of a deleted VM.
-
-## Default vzdump guarantees and shared operating requirements
-
-1. Refuse protected/template/locked VMs, HA or replication membership, and pending configuration. VMs with snapshots are accepted with `--keep-vm`; `--delete-vm` additionally requires `--allow-snapshot-loss` because deletion discards snapshot history. Refuse unused/excluded disks, host passthrough, physical CD-ROM devices, custom QEMU arguments, hooks, and external cloud-init snippets. A standard vzdump does not preserve all those resources or snapshot history.
-2. Gracefully shut down the VM. A shutdown timeout aborts; no forced power-off occurs. The VM stays stopped, including on failure.
-3. Create a zstd-compressed VMA backup in a unique local staging directory. Confirm the VM configuration is unchanged and acquire a Proxmox backup lock for the upload.
-4. Upload the archive and a SHA-256 manifest into a unique remote directory. Use [rclone check --download](https://rclone.org/commands/rclone_check/) for a full read-back comparison, then publish a verified `COMPLETE` marker. This reads the entire backup back from Drive and adds transfer time.
-5. Recheck the configuration, stopped state, and owned backup lock before destroying the VM. A failure before destruction prevents that call. Destruction itself is not transactional: a storage failure can leave partial deletion, with the verified remote and local backups retained.
-
-Run archive on the node that owns the VM, in a maintenance window. Disable competing automation and do not start, modify, migrate, unlock, or replace that VM while the command runs. The script's process lock serializes its own operations on one node; it is not a distributed lock against administrators. Proxmox handles its normal backup lock during vzdump; there is a short transition before this tool acquires its upload lock. A separate administrator or automation bypassing locks can defeat the checks. Keep this exclusive maintenance requirement even in unattended usage.
-
-Review `/etc/vzdump.conf` and any site backup hooks before use. Site defaults/hooks still apply. The archive preserves the guest backup, not host bridges, storage definitions, firewall files, cluster permissions, HA settings, or external resources. Recreate those as needed on another server. A byte-for-byte transfer check proves transfer integrity, not that the guest will boot or its applications are healthy; validate a restore before relying on this as your sole recovery process. See [Proxmox backup documentation](https://github.com/proxmox/pve-docs/blob/master/vzdump.adoc).
-
-Attached storage ISO images are allowed without changing the VM configuration. Their references are saved as `external_media` in the manifest and reported during archive and download. The ISO contents are not uploaded by this tool. Reattach the ISO on the destination or eject it before starting the restored VM if it is unavailable. Empty CD-ROM drives and standard cloud-init drives are accepted as well.
-
-Snapshots are not included in the default vzdump archive. Their names are recorded as `excluded_snapshots` in the manifest. With `--keep-vm`, the original snapshots remain on the server. With `--delete-vm --allow-snapshot-loss`, only the current VM state is recoverable from this backup; snapshot history is lost when the VM is destroyed. Use native mode above to preserve supported snapshot histories.
-
-## Failures and recovery
-
-If native local copy verification fails, do not remove the source disk or bypass verification. Version 0.4.1 records source/destination sizes, timestamps, and SHA-256 values in `copy-mismatch.json` inside that operation's staging directory. It distinguishes a changing source from a copy that differs from a stable source. This adds diagnostic evidence; it does not claim to fix an unexplained host copy mismatch. The original VM and staging files remain, and no upload or VM deletion is attempted at this failure point. Inspect both files before unlocking or retrying.
-
-Console output names the staging directory and prints the verified backup ID before deletion. Save console output if running unattended. Failed uploads may leave directories without `COMPLETE`; `list` ignores these. Re-running archive creates a new backup rather than trusting a previous interrupted operation. Rclone retries transient transfer errors within an operation.
-
-After failure, first verify no backup/upload process is still active and inspect `qm status VMID`, `qm config VMID`, and the printed local files. If this tool reached the upload phase, it intentionally leaves `lock: backup` to prevent unintentional starts. Once the failed task and files have been inspected, run `qm unlock VMID` manually before retrying or starting the VM. Never unlock an active task. A killed process can also leave the lock; automatic unlocking would be unsafe.
-
-An interrupted restore may leave a partially created VM. The script retains both downloaded and remote copies and refuses to overwrite the partial VM on retry. Inspect and remove that partial VM manually if appropriate, then restore again. If cleanup alone fails, the archive or restore may already have succeeded; inspect state before retrying.
-
-Remote archives are immutable by this script, not by Google Drive permissions. The completion marker is a checksum, not an authenticity signature. Trust and control the remote's writers. Partial remote uploads and retained local files can be removed manually after inspection. No automatic remote pruning is performed.
-
-## Validation
-
-Run `python3 -m unittest discover -s tests -v` from this directory. Tests simulate commands and inject upload/checksum/configuration failures. They do not execute a real VM deletion. Live Proxmox and Google Drive integration has not been tested in this workspace; perform the disposable-VM exercise before production use.
+From the source checkout, run `python3 -m unittest discover -s tests -v`. Tests include simulated Proxmox/rclone failure paths, real local sparse-file copies, resume guards, and installer rollback. They do not execute real VM deletion. GitHub Actions also checks installation and help on Linux. End-to-end Proxmox/Drive restore validation is still required.
