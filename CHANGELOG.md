@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.0
+
+- Automatically stream compressed VMA archives through parallel Drive uploads for VMs without snapshots, using a bounded 2.25 GiB default spool.
+- Pause production on quota blocks, cancel workers cleanly, and recover fully produced streams without regenerating their bytes. Restart interrupted production in a separate incomplete attempt.
+- Add schema 5 manifests, verified parallel compressed restore, guarded cleanup, and explicit legacy single-file comparison options.
+- Preserve native QCOW2 snapshot transport and all older archive readers.
+
 ## 0.9.0
 
 - Add versioned native QCOW2 multipart transport with 4 GiB parts, eight concurrent rclone transfers, and 128 MiB Google Drive upload chunks by default.

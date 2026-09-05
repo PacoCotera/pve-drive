@@ -59,3 +59,28 @@ Before booting either VM, obtain each source/destination disk path with `pvesm p
 Keep a results table with case, original GiB, part size, concurrency, Drive chunk size, transfer seconds, MiB/s, end-to-end seconds, peak RAM, retry count, and quota status. Eight 128 MiB upload buffers require about 1 GiB plus rclone/Python overhead; six require about 768 MiB. Select a smaller concurrency only if measured throughput, memory, or throttling supports it. There is no claimed speedup until the live results exist.
 
 After review, delete only the exact benchmark backup IDs you recorded if you no longer need them. `cleanup 100` handles incomplete attempts under `--source pve-benchmark`; it deliberately preserves complete cloud backups. Do not purge the normal archive root.
+
+## Compressed VMA comparison for large VMs without snapshots (0.10.0)
+
+This is the appropriate comparison when QCOW2 file lengths exceed local free space but VMA compression makes the backup much smaller. Use the same stopped VM and existing compression settings on the actual Hetzner-to-Drive path. The native comparison above does not represent this case.
+
+```bash
+# Previous compressed single-file stream; retain the VM.
+/usr/bin/time -v -o vma-single.time \
+  pve-drive --remote gdrive:pve-archive --source pve-benchmark \
+  upload 100 --keep-vm --stream --single-file --drive-chunk-size 128M \
+  > vma-single.log 2>&1
+
+# New normal command: compressed multipart, eight transfers, bounded spool.
+/usr/bin/time -v -o vma-multipart.time \
+  pve-drive --remote gdrive:pve-archive --source pve-benchmark \
+  upload 100 --keep-vm > vma-multipart.log 2>&1
+```
+
+Normal VMA upload needs only 3.25 GiB free for the default payload spool plus headroom, rather than the original QCOW2 lengths. Watch `du -sb /var/lib/vz/pve-drive/stream-100-*/spool` during transfer and a quota pause: the active spool should stay at or below 2.25 GiB. Logs and Proxmox temporary metadata are separate. The first upload starts after 256 MiB is produced; at least 2 GiB of compressed output is useful to exercise eight concurrent transfers. Smaller archives may finish before all workers become busy.
+
+Compare final compressed bytes / upload elapsed seconds, end-to-end duration, peak aggregate rclone RSS, compression CPU, disk I/O, and quota/retry count. The VMA multipart progress counter counts remotely verified bytes; production can be up to one spool ahead. Do not compare VMA whole-file SHA-256 across separate vzdump runs as a determinism test: embedded timestamps/headers can differ. Each run's downloaded/reconstructed SHA-256 must match its own manifest.
+
+Repeat with `--transfers 6` or `--part-size 512M` in later quota windows if useful. Keep 128M upload chunks for both cases to isolate independent-transfer concurrency. To measure the previous 32M behavior, run the legacy case separately with `--drive-chunk-size 32M`. Do not consume the account's daily upload budget with an entire matrix at once. No live throughput improvement is claimed before results exist.
+
+To test quota recovery without changing the spool limit, let the process remain running while blocked and confirm it continues when Drive permits uploads again. For process interruption, Ctrl-C and rerun the normal command: fully certified production resumes remaining files; uncertified production explicitly restarts a new stream while retaining the old attempt for cleanup. Restore the completed backup to an unused VM ID with the normal restore command and verify expected guest data before considering the test successful.

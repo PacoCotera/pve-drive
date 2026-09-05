@@ -14,14 +14,17 @@ import sys
 import tempfile
 import time
 import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.9.0'
+__version__ = '0.10.0'
 
 PART_SIZE = 4 * 1024 ** 3
 TRANSFERS = 8
+VMA_PART_SIZE = 256 * 1024 ** 2
 
 
 def part_size(value):
@@ -273,7 +276,7 @@ class Console:
 
 console = Console()
 
-def run(*args, capture=False):
+def run(*args, capture=False, cancel_event=None, progress=True):
     args = list(map(str, args))
     console.command(args)
     label = None
@@ -310,12 +313,14 @@ def run(*args, capture=False):
                         pending = pending[end:]
                 try:
                     while proc.poll() is None:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise RuntimeError('Transfer cancelled; recovery files retained')
                         try:
                             proc.wait(timeout=1)
                         except subprocess.TimeoutExpired:
                             pass
                         drain()
-                        if proc.poll() is None and not rclone:
+                        if proc.poll() is None and not rclone and progress:
                             console.update()
                 except BaseException:
                     proc.terminate()
@@ -327,7 +332,8 @@ def run(*args, capture=False):
                     drain(final=True)
                     raise
                 drain(final=True)
-        console.clear()
+        if progress:
+            console.clear()
         if proc.returncode:
             with err_path.open('rb') as f:
                 f.seek(max(0, err_path.stat().st_size - 4000))
@@ -485,6 +491,176 @@ def stream_pipeline(producer_args, upload_args, check_args, stage, *,
             console.clear()
 
 
+def multipart_stream_pipeline(producer_args, check_args, stage, filename, size, transfers,
+                              upload_part, on_complete, estimated_total=None):
+    """Bounded spool: at most transfers+1 part files; pause producer under backpressure.
+
+    upload_part(path, record, cancel) verifies remote bytes before returning.
+    on_complete(result) durably records successful production before waiting for
+    the remaining uploads. Never record a receipt for a failed producer/checker.
+    """
+    spool = stage / 'spool'
+    spool.mkdir()
+    cancel = threading.Event()
+    slots = threading.BoundedSemaphore(transfers + 1)
+    ready = queue.Queue()
+    parts, errors, futures = [], [], []
+    state = {'size': 0}
+    transfer_state = {'uploaded': 0}
+    progress_lock = threading.Lock()
+    whole = hashlib.sha256()
+    processes = []
+    relay = None
+    pool = ThreadPoolExecutor(max_workers=transfers)
+    with ExitStack() as stack:
+        readers = []
+        def launch(name, command, **kwargs):
+            log = stack.enter_context((stage / (name + '.log')).open('wb'))
+            readers.append(stack.enter_context((stage / (name + '.log')).open('r', errors='replace')))
+            proc = subprocess.Popen(list(map(str, command)), stderr=log,
+                                    start_new_session=(os.name == 'posix'), **kwargs)
+            processes.append((name, proc))
+            return proc
+        def drain():
+            for reader in readers:
+                while True:
+                    data = reader.read(65536)
+                    if not data:
+                        break
+                    console.output(data)
+        def stop():
+            cancel.set()
+            for name, proc in processes:
+                if proc.poll() is None:
+                    try:
+                        if os.name == 'posix':
+                            os.killpg(proc.pid, signal.SIGINT if name == 'vzdump' else signal.SIGTERM)
+                        else:
+                            proc.terminate()
+                    except ProcessLookupError:
+                        pass
+            for _, proc in processes:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    if os.name == 'posix':
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        proc.kill()
+                    proc.wait()
+        def send(path, record):
+            upload_part(path, record, cancel)
+            # Only verified remote data allows releasing local spool capacity.
+            path.unlink()
+            with progress_lock:
+                transfer_state['uploaded'] += record['size']
+            slots.release()
+        try:
+            checker = launch('zstd-check', check_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+            producer = launch('vzdump', producer_args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+            def produce():
+                try:
+                    while not cancel.is_set():
+                        block = producer.stdout.read1(min(size, 1024 ** 2))
+                        if not block:
+                            break
+                        while not slots.acquire(timeout=.2):
+                            if cancel.is_set():
+                                return
+                        if cancel.is_set():
+                            return
+                        name = f'{filename}.part-{len(parts):06d}'
+                        temporary = spool / (name + '.partial')
+                        length = 0
+                        sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
+                        with temporary.open('wb') as out:
+                            while block:
+                                out.write(block)
+                                checker.stdin.write(block)
+                                sha.update(block)
+                                md5.update(block)
+                                whole.update(block)
+                                length += len(block)
+                                state['size'] += len(block)
+                                if length == size:
+                                    break
+                                block = producer.stdout.read1(min(size - length, 1024 ** 2))
+                            out.flush()
+                            os.fsync(out.fileno())
+                        path = spool / name
+                        temporary.replace(path)
+                        record = {'filename': name, 'size': length, 'sha256': sha.hexdigest(), 'md5': md5.hexdigest()}
+                        parts.append(record)
+                        ready.put((path, record))
+                        if length < size:
+                            break
+                    checker.stdin.close()
+                except BaseException as exc:
+                    errors.append(exc)
+            console.stage('Streaming compressed backup to Google Drive')
+            relay = threading.Thread(target=produce, daemon=True)
+            relay.start()
+            certified = False
+            while True:
+                drain()
+                while True:
+                    try:
+                        path, record = ready.get_nowait()
+                    except queue.Empty:
+                        break
+                    futures.append(pool.submit(send, path, record))
+                failures = [(name, proc.returncode) for name, proc in processes
+                            if proc.poll() is not None and proc.returncode != 0]
+                if failures or errors:
+                    raise RuntimeError(f'Multipart stream failed: {failures or errors}; see {stage}')
+                if not relay.is_alive() and all(proc.poll() == 0 for _, proc in processes):
+                    if not state['size']:
+                        raise ValueError('Empty multipart VMA stream')
+                    if not certified:
+                        drain()
+                        result = dict(state, sha256=whole.hexdigest(), part_size=size, parts=parts)
+                        on_complete(result)
+                        certified = True
+                for future in list(futures):
+                    if future.done():
+                        future.result()
+                        futures.remove(future)
+                if certified and not futures and ready.empty():
+                    console.update(result['size'], result['size'], force=True)
+                    return result
+                console.update(transfer_state['uploaded'], state['size'] if certified else estimated_total,
+                               estimated=not certified and estimated_total is not None)
+                time.sleep(.2)
+        except BaseException as exc:
+            stop()
+            if isinstance(exc, Exception):
+                details = []
+                for name, _ in processes:
+                    path = stage / (name + '.log')
+                    with path.open('rb') as log:
+                        log.seek(max(0, path.stat().st_size - 1500))
+                        details.append(log.read().decode(errors='replace').strip())
+                raise RuntimeError(str(exc) + '\n' + '\n'.join(details)) from exc
+            raise
+        finally:
+            cancel.set()
+            stop()
+            pool.shutdown(wait=True, cancel_futures=True)
+            if relay is not None:
+                relay.join(timeout=10)
+            for _, proc in processes:
+                for pipe in (proc.stdin, proc.stdout):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
+            drain()
+
+
 def stream_size_estimate(config):
     """Conservative display estimate, never an integrity limit or space check."""
     total = 0
@@ -503,11 +679,11 @@ def stream_size_estimate(config):
     return (total * 102 + 99) // 100 + 64 * 1024 ** 2 if total else None
 
 
-def file_hash(path, algorithm='sha256'):
+def file_hash(path, algorithm='sha256', progress=True):
     h = hashlib.md5(usedforsecurity=False) if algorithm == 'md5' else hashlib.sha256()
     md5 = hashlib.md5(usedforsecurity=False) if algorithm == 'both' else None
     total = Path(path).stat().st_size
-    show = total >= 64 * 1024 * 1024
+    show = progress and total >= 64 * 1024 * 1024
     if show:
         label = 'SHA-256 + MD5' if algorithm == 'both' else algorithm.upper()
         console.stage(f'Computing {label}: {Path(path).name}')
@@ -803,8 +979,8 @@ class Manager:
     def api(self, path):
         return json.loads(run('pvesh', 'get', path, '--output-format', 'json', capture=True))
 
-    def verify_upload(self, payload, destination, local_checks=None, completion_hash=None):
-        if getattr(self.a, 'deep_verify', False):
+    def verify_upload(self, payload, destination, local_checks=None, completion_hash=None, metadata_only=False):
+        if getattr(self.a, 'deep_verify', False) and not metadata_only:
             # A retried publication may already have its marker. Its exact
             # contents are checked separately; it is not part of the payload.
             self.rc('check', payload, destination, '--download',
@@ -1036,6 +1212,20 @@ class Manager:
 
     def archive(self):
         ident = vmid(self.a.vmid)
+        pending = self.vma_attempt(ident)
+        if pending is not None:
+            if (pending / 'stream-complete.json').exists():
+                return self.resume_vma_multipart(ident, pending, delete_vm=self.a.delete_vm)
+            if getattr(self.a, 'resume', None):
+                raise ValueError('VMA production was interrupted; repeat upload without --resume to restart safely')
+            attempt = json.loads((pending / 'attempt.json').read_text())
+            if attempt.get('source_node') != Path('/etc/pve/local').resolve().name:
+                raise ValueError('Interrupted VMA attempt belongs to another node')
+            if self.config(ident).get('lock'):
+                raise ValueError('Interrupted VMA producer left a VM lock; inspect vzdump/VM state before restarting')
+            (pending / 'SUPERSEDED').write_text('Incomplete production; normal upload restarted in a new attempt\n')
+            console.note('Previous VMA production was interrupted; starting a new stream. '
+                         'Old incomplete files remain available to cleanup VMID.')
         if not getattr(self.a, 'resume', None) and not getattr(self.a, 'stream', False):
             attempts = []
             for stage in sorted(self.work.glob(f'native-{ident}-*')):
@@ -1073,11 +1263,15 @@ class Manager:
         snapshots = self.api(self.vm_path(ident) + '/snapshot')
         snapshot_names = [s['name'] for s in snapshots if s.get('name') != 'current']
         if getattr(self.a, 'stream', False):
+            if not snapshot_names and not getattr(self.a, 'single_file', False) and not getattr(self.a, 'resume', None):
+                return self.archive_vma_multipart(ident, cfg, external_media)
             if snapshot_names or getattr(self.a, 'resume', None) or getattr(self.a, 'deep_verify', False):
                 raise ValueError('--stream requires no snapshots and cannot be combined with --resume or --deep-verify')
             return self.archive_stream(ident, cfg, external_media)
         if self.a.format == 'native-qcow2' or (self.a.format == 'auto' and snapshot_names) or getattr(self.a, 'resume', None):
             return self.archive_native(ident, cfg, snapshot_names)
+        if self.a.format == 'auto' and not snapshot_names and not getattr(self.a, 'single_file', False):
+            return self.archive_vma_multipart(ident, cfg, external_media)
         if snapshot_names:
             if self.a.delete_vm and not self.a.allow_snapshot_loss:
                 raise ValueError('VM has snapshots. Archive contains current state only; '
@@ -1145,6 +1339,195 @@ class Manager:
             run('qm', 'unlock', ident)
         self.finish_staging(stage)
         console.note('Archive complete. VM ' + ('deleted.' if self.a.delete_vm else 'retained, stopped.'))
+
+    def vma_attempt(self, ident):
+        """Find one unfinished multipart VMA attempt for the normal upload command."""
+        selected = getattr(self.a, 'resume', None)
+        candidates = [Path(selected)] if selected else sorted(self.work.glob(f'stream-{ident}-*'))
+        found = []
+        for requested in candidates:
+            stage = requested.resolve()
+            record = stage / 'attempt.json'
+            if requested.is_symlink() or stage.parent != self.work or not stage.name.startswith(f'stream-{ident}-'):
+                if selected:
+                    return None
+                continue
+            if record.is_symlink() or not record.is_file() or (stage / 'UPLOAD_DONE').exists() or (stage / 'SUPERSEDED').exists():
+                continue
+            attempt = json.loads(record.read_text())
+            if attempt.get('kind') != 'multipart-vma':
+                continue
+            bid = backup_id(attempt.get('backup_id', ''))
+            if attempt.get('destination') != self.base + '/' + bid or bid.split('/')[0] != ident:
+                if selected:
+                    raise ValueError('Multipart VMA attempt remote/source/VMID mismatch')
+                continue
+            found.append(stage)
+        if len(found) > 1:
+            raise ValueError('Multiple unfinished VMA attempts; choose --resume STAGING_DIR or cleanup VMID')
+        return found[0] if found else None
+
+    def part_rc(self, cancel, *args, capture=False):
+        # Individual transfers run in worker threads. Keep aggregate progress on
+        # the main thread and make subprocesses cancellable even during retries.
+        return run('rclone', '--config', self.a.rclone_config, '--retries', '5',
+                   '--low-level-retries', '10', *args, capture=capture, cancel_event=cancel, progress=False)
+
+    def upload_vma_part(self, path, part, destination, cancel):
+        if cancel.is_set():
+            raise RuntimeError('Multipart upload cancelled')
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('Missing local VMA part')
+        sha, md5 = file_hash(path, 'both', progress=False)
+        if path.stat().st_size != part['size'] or sha != part['sha256'] or md5 != part['md5']:
+            raise ValueError('Local VMA part checksum mismatch')
+        remote = destination + '/' + part['filename']
+        self.quota_retry(lambda: self.part_rc(cancel, 'copyto', path, remote, '--immutable', '--checksum',
+                         '--transfers', '1', '--drive-chunk-size', getattr(self.a, 'drive_chunk_size', None) or '128M',
+                         '--drive-stop-on-upload-limit'), cancel_event=cancel)
+        rows = json.loads(self.part_rc(cancel, 'lsjson', remote, '--files-only', '--hash', capture=True))
+        if (len(rows) != 1 or rows[0].get('Path') != part['filename'] or rows[0].get('Size') != part['size']
+                or {k.lower(): v.lower() for k, v in rows[0].get('Hashes', {}).items()}.get('md5') != part['md5']):
+            raise ValueError('Cloud VMA part size/MD5 mismatch')
+        if getattr(self.a, 'deep_verify', False):
+            self.part_rc(cancel, 'check', path.parent, destination, '--include', '/' + part['filename'],
+                         '--one-way', '--download')
+        if file_hash(path, 'sha256', progress=False) != part['sha256']:
+            raise ValueError('VMA part changed during upload')
+
+    def archive_vma_multipart(self, ident, cfg, external_media):
+        features = json.loads(self.rc('backend', 'features', self.base, capture=True))
+        if 'md5' not in [str(h).lower() for h in features.get('Hashes', [])]:
+            raise ValueError('Multipart VMA upload requires remote MD5 support')
+        self.rc('mkdir', self.base)
+        self.rc('lsjson', self.base, '--max-depth', '1', capture=True)
+        size = getattr(self.a, 'part_size', None) or VMA_PART_SIZE
+        transfers = getattr(self.a, 'transfers', TRANSFERS)
+        stage = self.stage(f'stream-{ident}-')
+        budget = size * (transfers + 1) + 1024 ** 3
+        self.require_staging_space(stage, budget, 'Insufficient space for bounded multipart VMA spool')
+        console.note(f'Upload staging limit: {human_bytes(size * (transfers + 1))}; '
+                     'verified uploads release staging space automatically')
+        stamp = datetime.now(timezone.utc)
+        bid = f'{ident}/{stamp:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}'
+        destination = self.base + '/' + bid
+        filename = f'vzdump-qemu-{ident}-{stamp:%Y_%m_%d-%H_%M_%S}.vma.zst'
+        atomic_json(stage / 'attempt.json', {'kind': 'multipart-vma', 'destination': destination,
+                    'backup_id': bid, 'source_node': Path('/etc/pve/local').resolve().name, 'config': cfg})
+        run('qm', 'shutdown', ident, '--timeout', self.a.shutdown_timeout)
+        self.unchanged(ident, cfg.copy())
+        (stage / 'tmp').mkdir()
+        (stage / 'payload').mkdir()
+        def completed(result):
+            expected = {key: str(value).split(',')[0] for key, value in cfg.items()
+                        if DISK_KEY.fullmatch(key) and 'media=cdrom' not in str(value).split(',')}
+            included = {}
+            for line in (stage / 'vzdump.log').read_text(errors='replace').splitlines():
+                match = re.search(r"include disk '([^']+)' '([^']+)'", line)
+                if match:
+                    included[match[1]] = match[2]
+            if not expected or included != expected:
+                raise ValueError('Stream disk inventory differs from VM configuration; VM retained')
+            self.unchanged(ident, cfg.copy())
+            manifest = {'schema': 5, 'format': 'vzdump', 'transport': {'format': 'pve-drive-parts', 'version': 1},
+                        'backup_id': bid, 'vmid': int(ident), 'source': self.a.source,
+                        'source_node': Path('/etc/pve/local').resolve().name, 'config': cfg,
+                        'external_media': external_media, 'excluded_snapshots': [], 'snapshots': [],
+                        'created_utc': stamp.isoformat(), 'filename': filename, 'streamed': True,
+                        'included_disks': included, **result}
+            self.validate_manifest(manifest, bid)
+            path = stage / 'payload' / 'manifest.json'
+            atomic_json(path, manifest)
+            atomic_json(stage / 'stream-complete.json', {'manifest_sha256': sha256(path)})
+            latest = self.config(ident)
+            self.unchanged(ident, cfg.copy())
+            run('qm', 'set', ident, '--lock', 'backup', '--digest', latest['digest'])
+        multipart_stream_pipeline(
+            ['vzdump', ident, '--mode', 'stop', '--compress', 'zstd', '--stdout', '1',
+             '--tmpdir', str(stage / 'tmp'), '--remove', '0'], ['zstd', '--test', '-'],
+            stage, filename, size, transfers,
+            lambda path, part, cancel: self.upload_vma_part(path, part, destination, cancel), completed,
+            estimated_total=stream_size_estimate(cfg))
+        m = json.loads((stage / 'payload' / 'manifest.json').read_text())
+        self.finalize_vma_multipart(ident, stage, m, delete_vm=self.a.delete_vm)
+
+    def resume_vma_multipart(self, ident, stage, delete_vm=False, recover_only=False):
+        # No producer can be replayed safely: vzdump timestamps/headers can differ.
+        # A receipt certifies ALL original compressed bytes, not merely a prefix.
+        if any(path.is_symlink() for path in stage.rglob('*')):
+            raise ValueError('VMA recovery refuses symlinks')
+        path = stage / 'payload' / 'manifest.json'
+        receipt = stage / 'stream-complete.json'
+        if not receipt.is_file():
+            raise ValueError('VMA production was interrupted; restart the normal upload command without --resume')
+        if json.loads(receipt.read_text()).get('manifest_sha256') != sha256(path):
+            raise ValueError('Multipart VMA recovery receipt mismatch')
+        m = json.loads(path.read_text())
+        self.validate_manifest(m, backup_id(m.get('backup_id', '')))
+        if m['schema'] != 5 or str(m['vmid']) != ident or m.get('source_node') != Path('/etc/pve/local').resolve().name:
+            raise ValueError('Multipart VMA recovery identity mismatch')
+        attempt = json.loads((stage / 'attempt.json').read_text())
+        destination = self.base + '/' + m['backup_id']
+        if attempt.get('destination') != destination:
+            raise ValueError('Multipart VMA recovery remote mismatch')
+        current = self.config(ident)
+        self.unchanged(ident, dict(m['config'], **({'lock': 'backup'} if current.get('lock') == 'backup' else {})))
+        if 'lock' not in current:
+            run('qm', 'set', ident, '--lock', 'backup', '--digest', current['digest'])
+        spool = stage / 'spool'
+        allowed = {part['filename'] for part in m['parts']}
+        if not spool.is_dir() or any(p.name not in allowed or not p.is_file() for p in spool.iterdir()):
+            raise ValueError('Unexpected VMA recovery spool files')
+        if not recover_only:
+            cancel = threading.Event()
+            pool = ThreadPoolExecutor(max_workers=getattr(self.a, 'transfers', TRANSFERS))
+            try:
+                futures = [pool.submit(self.upload_vma_part, spool / part['filename'], part, destination, cancel)
+                           for part in m['parts'] if (spool / part['filename']).exists()]
+                while futures:
+                    for future in list(futures):
+                        if future.done():
+                            future.result()
+                            futures.remove(future)
+                    time.sleep(.2)
+            finally:
+                cancel.set()
+                pool.shutdown(wait=True, cancel_futures=True)
+        self.finalize_vma_multipart(ident, stage, m, delete_vm=delete_vm)
+
+    def finalize_vma_multipart(self, ident, stage, m, delete_vm=False):
+        expected = dict(m['config'], lock='backup')
+        self.unchanged(ident, expected.copy())
+        destination = self.base + '/' + m['backup_id']
+        path = stage / 'payload' / 'manifest.json'
+        manifest_sha, manifest_md5 = file_hash(path, 'both')
+        if json.loads((stage / 'stream-complete.json').read_text()).get('manifest_sha256') != manifest_sha:
+            raise ValueError('Multipart VMA completion receipt mismatch')
+        checks = {part['filename']: (part['size'], part['md5']) for part in m['parts']}
+        checks['manifest.json'] = (path.stat().st_size, manifest_md5)
+        self.quota_retry(lambda: self.rc('copyto', path, destination + '/manifest.json', '--immutable',
+                                        '--checksum', '--drive-stop-on-upload-limit'))
+        self.verify_upload(stage / 'payload', destination, local_checks=checks,
+                           completion_hash=manifest_sha, metadata_only=True)
+        if self.rc('cat', destination + '/manifest.json', capture=True).encode() != path.read_bytes():
+            raise ValueError('Multipart VMA manifest read-back mismatch')
+        self.unchanged(ident, expected.copy())
+        marker = stage / 'COMPLETE'
+        marker.write_bytes((manifest_sha + '\n').encode())
+        self.quota_retry(lambda: self.rc('copyto', marker, destination + '/COMPLETE', '--immutable',
+                                        '--checksum', '--drive-stop-on-upload-limit'))
+        if self.rc('cat', destination + '/COMPLETE', capture=True) != marker.read_text():
+            raise ValueError('Completion marker verification failed')
+        self.unchanged(ident, expected.copy())
+        if delete_vm:
+            run('qm', 'destroy', ident, '--skiplock', '1', '--purge', '1')
+            if any(str(x.get('vmid')) == ident for x in self.api('/cluster/resources')):
+                raise ValueError('VM still appears in cluster')
+        else:
+            run('qm', 'unlock', ident)
+        (stage / 'UPLOAD_DONE').write_text(m['backup_id'] + '\n')
+        self.finish_staging(stage)
+        console.note('Multipart VMA archive complete. VM ' + ('deleted.' if delete_vm else 'retained, stopped.'))
 
     def archive_stream(self, ident, cfg, external_media):
         features = json.loads(self.rc('backend', 'features', self.base, capture=True))
@@ -1281,7 +1664,7 @@ class Manager:
         return destination, m
 
     def validate_manifest(self, m, bid):
-        expected_schemas = (2, 3, 4) if self.a.source else (1,)
+        expected_schemas = (2, 3, 4, 5) if self.a.source else (1,)
         if m.get('schema') not in expected_schemas or m.get('backup_id') != bid or str(m.get('vmid')) != bid.split('/')[0]:
             raise ValueError('Invalid manifest identity/schema')
         if self.a.source and m.get('source') != self.a.source:
@@ -1293,6 +1676,23 @@ class Manager:
             raise ValueError('Unsafe archive filename')
         if not re.fullmatch(r'[a-f0-9]{64}', m.get('sha256', '')) or not isinstance(m.get('size'), int) or m['size'] <= 0:
             raise ValueError('Invalid archive checksum/size')
+        if m['schema'] == 5:
+            if (m.get('format') != 'vzdump' or m.get('transport') != {'format': 'pve-drive-parts', 'version': 1}
+                    or m.get('streamed') is not True or m.get('excluded_snapshots') != [] or m.get('snapshots') != []):
+                raise ValueError('Invalid multipart VMA format/version/snapshots')
+            size, parts = m.get('part_size'), m.get('parts')
+            if type(size) is not int or size <= 0 or not isinstance(parts, list) or len(parts) != (m['size'] + size - 1) // size:
+                raise ValueError('Invalid multipart VMA part count/size')
+            for index, part in enumerate(parts):
+                if (not isinstance(part, dict) or part.get('filename') != f'{m["filename"]}.part-{index:06d}'
+                        or type(part.get('size')) is not int or part['size'] != min(size, m['size'] - index * size)
+                        or not re.fullmatch(r'[a-f0-9]{64}', part.get('sha256', ''))
+                        or not re.fullmatch(r'[a-f0-9]{32}', part.get('md5', ''))):
+                    raise ValueError('Invalid multipart VMA ordering/size/checksum')
+            expected = {key: str(value).split(',')[0] for key, value in m.get('config', {}).items()
+                        if DISK_KEY.fullmatch(key) and 'media=cdrom' not in str(value).split(',')}
+            if not expected or m.get('included_disks') != expected:
+                raise ValueError('Multipart VMA disk inventory mismatch')
 
     def recover(self):
         ident = vmid(self.a.vmid)
@@ -1302,6 +1702,8 @@ class Manager:
                 not stage.name.startswith((f'native-{ident}-', f'archive-{ident}-', f'stream-{ident}-'))):
             raise ValueError('Recovery requires this VM staging directory directly under --work-dir')
         if stage.name.startswith(f'stream-{ident}-'):
+            if self.vma_attempt(ident) == stage:
+                return self.resume_vma_multipart(ident, stage, recover_only=True)
             return self.recover_stream(ident, stage)
         payload = stage / 'payload'
         if not payload.is_dir() or payload.is_symlink():
@@ -1389,8 +1791,51 @@ class Manager:
         self.finish_staging(stage)
         console.note(f'Recovery complete: VM {ident} retained, stopped and unlocked; cloud archive ready to restore')
 
+    def download_vma_multipart(self, destination, m):
+        resume = getattr(self.a, 'resume', None)
+        if resume:
+            requested = Path(resume)
+            stage = requested.resolve()
+            if (requested.is_symlink() or stage.parent != self.work or not stage.name.startswith('restore-')
+                    or not stage.is_dir() or any(p.is_symlink() for p in stage.rglob('*'))):
+                raise ValueError('VMA download resume requires its staging directory under --work-dir')
+            if json.loads((stage / 'download.json').read_text()) != {'destination': destination, 'manifest': m}:
+                raise ValueError('VMA download resume archive mismatch')
+        else:
+            stage = self.stage('restore-')
+        # Original VM capacity is irrelevant here: these are compressed bytes.
+        existing = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file()) if resume else 0
+        self.require_staging_space(stage, max(0, 2 * m['size'] - existing) + 1024 ** 3,
+                                   'Insufficient staging space for compressed VMA parts and reconstruction')
+        atomic_json(stage / 'download.json', {'destination': destination, 'manifest': m})
+        parts = stage / 'parts'
+        parts.mkdir(exist_ok=True)
+        missing = []
+        for part in m['parts']:
+            path = parts / part['filename']
+            if not path.is_file() or path.stat().st_size != part['size'] or sha256(path) != part['sha256']:
+                missing.append(part['filename'])
+        if missing:
+            selection = stage / 'download-files.txt'
+            selection.write_text('\n'.join(missing) + '\n')
+            self.rc('copy', destination, parts, '--files-from-raw', selection, '--ignore-times',
+                    '--transfers', getattr(self.a, 'transfers', TRANSFERS), '--multi-thread-streams', '0')
+        target = stage / m['filename']
+        if target.is_file() and target.stat().st_size == m['size'] and sha256(target) == m['sha256']:
+            check_parts(parts, m)
+        else:
+            if target.exists():
+                target.unlink()
+            check_parts(parts, m, target)
+        run('zstd', '--test', target)
+        report_media(m.get('external_media', {}))
+        report_pci(m.get('config', {}))
+        return stage, target
+
     def download(self):
         destination, m = self.manifest(self.a.backup_id)
+        if m.get('schema') == 5:
+            return self.download_vma_multipart(destination, m)
         if getattr(self.a, 'resume', None) and m.get('schema') != 4:
             raise ValueError('Download resume requires a multipart native archive')
         if m.get('schema') in (3, 4):
@@ -1435,6 +1880,8 @@ class Manager:
         if getattr(self.a, 'resume', None):
             raise ValueError('--stream cannot be combined with --resume')
         destination, manifest = self.manifest(self.a.backup_id)
+        if manifest.get('schema') == 5:
+            raise ValueError('Multipart VMA restore verifies a staged reconstruction; omit --stream')
         if manifest.get('schema') in (3, 4):
             raise ValueError('--stream restore supports VMA archives only; native QCOW2 needs staged restore')
         report_media(manifest.get('external_media', {}))
@@ -1641,7 +2088,7 @@ class Manager:
             info = self.qcow_info(path, snapshots)
             dest = payload / (key + '.qcow2')
             if multipart:
-                record = split_native(path, payload, dest.name, getattr(self.a, 'part_size', PART_SIZE))
+                record = split_native(path, payload, dest.name, (getattr(self.a, 'part_size', None) or PART_SIZE))
                 record['original_filename'] = path.name
                 expected_parts = {part['filename'] for part in record['parts']}
                 for previous in payload.glob(dest.name + '.part-*'):
@@ -1704,7 +2151,7 @@ class Manager:
         return {'vm.conf', 'manifest.json'} | {
             part['filename'] for d in m['disks'] for part in d['parts']}
 
-    def quota_retry(self, operation):
+    def quota_retry(self, operation, cancel_event=None):
         retries = getattr(self.a, 'quota_retries', 24)
         for attempt in range(retries + 1):
             try:
@@ -1719,7 +2166,11 @@ class Manager:
                 console.note(f'Drive upload quota blocked; retrying in {delay}s '
                              f'({attempt + 1}/{retries}). Completed parts are retained. '
                              'Ctrl-C safely leaves the attempt resumable.')
-                time.sleep(delay)
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        raise RuntimeError('Quota wait cancelled; recovery files retained')
+                else:
+                    time.sleep(delay)
 
     def resume_multipart(self, ident, stage, cfg):
         payload = stage / 'payload'
@@ -2028,17 +2479,17 @@ def parser():
         description='Shut down the source VM, select the archive format automatically, upload and verify, then delete it. '
                     'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history. '
                     'Direct GPU/HD-audio passthrough is supported; host hardware is not archived. '
-                    '--stream avoids a local archive for VMs without snapshots.',
+                    'VMs without snapshots use compressed multipart streaming with bounded staging automatically.',
         epilog='Multipart uploads resume completed parts after interruption or quota exhaustion. '
                'Use the exact printed staging path, keep the VM stopped and backup-locked, and do not unlock first. '
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
-    to.add_argument('--stream', action='store_true', help='Stream VMA directly to cloud without a local archive; requires no snapshots and remote streaming/MD5 support. Progress uses an estimated maximum size/ETA; interrupted streams restart from the beginning')
+    to.add_argument('--stream', action='store_true', help='Explicitly select compressed multipart VMA streaming (already automatic without snapshots); bounded staging, parallel uploads and quota retries. With --single-file, use the legacy unspooled stream')
     to.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'],
-                    help='Drive upload chunk size (native multipart default: 128M; streaming: 32M); buffered per transfer')
+                    help='Drive upload chunk size (multipart default: 128M; legacy single-file stream: 32M); buffered per transfer')
     to.add_argument('--deep-verify', action='store_true', help='Verify upload by downloading it again (default: require matching cloud sizes and MD5 hashes)')
-    to.add_argument('--resume', metavar='STAGING_DIR', help='Resume an interrupted native copy or multipart upload; one recorded unfinished multipart upload is selected automatically')
+    to.add_argument('--resume', metavar='STAGING_DIR', help='Resume native copies/uploads or a fully produced multipart VMA stream; unfinished production restarts via the normal upload command')
     to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain staging after success (default: remove it); failures retain files')
     to.add_argument('--shutdown-timeout', type=int, default=300, help='Graceful shutdown timeout in seconds (default: %(default)s); no forced stop')
     fr = sub.add_parser('move-from-cloud', help='Restore latest complete archive to its original VMID')
@@ -2088,12 +2539,12 @@ def parser():
     v.add_argument('backup_id', type=backup_id)
     v.add_argument('--cleanup-local', action='store_true')
     for command in (to, a):
-        command.add_argument('--part-size', type=part_size, default=PART_SIZE, metavar='SIZE',
-                             help='Advanced: native archive part size, binary M/G/T (default: 4G)')
+        command.add_argument('--part-size', type=part_size, default=None, metavar='SIZE',
+                             help='Advanced: archive part size, binary M/G/T (default: native 4G; VMA 256M)')
         command.add_argument('--transfers', type=transfer_count, default=TRANSFERS,
-                             help='Advanced: concurrent native file transfers (default: 8)')
+                             help='Advanced: concurrent file transfers (default: 8)')
         command.add_argument('--single-file', action='store_true',
-                             help='Advanced: legacy native transport for comparison benchmarks')
+                             help='Advanced: legacy single-file transport; combine with --stream for the old VMA stream')
         command.add_argument('--quota-retries', type=int, choices=range(0, 169), default=24, metavar='N',
                              help='Advanced: retry Drive upload quota errors N times (default: 24; 0 exits resumably)')
         command.add_argument('--quota-retry-delay', type=int, choices=range(60, 86401), default=3600, metavar='SECONDS',

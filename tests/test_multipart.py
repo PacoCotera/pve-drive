@@ -474,7 +474,8 @@ class PartPrimitivesTests(unittest.TestCase):
     def test_cli_defaults_and_invalid_tuning(self):
         base = ['--remote', 'gdrive:pve-archive', '--source', 'pve-site-a']
         a = p.parser().parse_args(base + ['upload', '100'])
-        self.assertEqual(a.part_size, 4 * 1024 ** 3)
+        self.assertIsNone(a.part_size)
+        self.assertEqual(p.PART_SIZE, 4 * 1024 ** 3)
         self.assertEqual(a.transfers, 8)
         self.assertEqual(a.quota_retries, 24)
         self.assertFalse(a.single_file)

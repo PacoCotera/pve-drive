@@ -126,6 +126,7 @@ class StreamLifecycleTests(unittest.TestCase):
         self.m = self.case.m
         self.a = self.case.args
         self.a.stream = True
+        self.a.single_file = True  # Explicitly exercise legacy single-file streams.
         self.a.deep_verify = False
         self.a.cleanup_local = False
         self.features = {'Features': {'PutStream': True}, 'Hashes': ['MD5']}

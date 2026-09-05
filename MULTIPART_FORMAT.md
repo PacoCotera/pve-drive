@@ -75,13 +75,28 @@ On recognized Drive upload-quota errors, pve-drive waits one hour and retries, u
 
 ## Compatibility
 
-Readers dispatch on the manifest schema, and schema 4 additionally requires the transport version above:
+Readers dispatch on the manifest schema; schemas 4 and 5 additionally require the transport version:
 
 | Schema | Transport | Read support |
 | --- | --- | --- |
 | 1 | Legacy VMA layout, without a source label | Retained |
 | 2 | Source-scoped staged or streamed VMA | Retained |
 | 3 | Source-scoped single-file native QCOW2 | Retained |
-| 4 | Source-scoped multipart native QCOW2, transport version 1 | New default for native archives |
+| 4 | Source-scoped multipart native QCOW2, transport version 1 | Default for native archives |
+| 5 | Source-scoped compressed multipart VMA, transport version 1 | Default without snapshots from 0.10.0 |
 
 Older pve-drive versions cannot restore schema 4. Upgrade the destination executable to 0.9.0 or newer before restoring it. `--single-file` is an advanced native upload comparison option that writes schema 3. Automatic VMA/native selection and unsupported snapshot-layout rejection are unchanged.
+
+## Schema 5: compressed multipart VMA (0.10.0)
+
+For VMs without snapshots, normal upload selects `schema: 5`, `format: "vzdump"`, and `transport: {"format": "pve-drive-parts", "version": 1}`. This transports the compressed output of `vzdump --mode stop --compress zstd --stdout 1`; it does not transport native QCOW2 bytes or claim internal snapshot preservation. Snapshot VMs still select schema 4.
+
+The remote directory remains `sources/SOURCE/VMID/TIMESTAMP-UUID/`. It contains `vzdump-qemu-VMID-TIMESTAMP.vma.zst.part-000000`, subsequent independent parts, `manifest.json`, and finally `COMPLETE`. Each part is a fixed byte range in the compressed stream, not an independently decompressible zstd archive. Concatenate manifest order before decompression. Default part size is 256 MiB; the last part may be shorter. There is no empty trailing part.
+
+The top-level manifest retains `backup_id`, `source`, `source_node`, `vmid`, `config`, `external_media`, `created_utc`, `filename`, `streamed: true`, `included_disks`, `excluded_snapshots: []`, and `snapshots: []`. `filename` is the original compressed VMA name. `size` is its exact compressed byte length; `sha256` is its complete original compressed SHA-256. `part_size` and ordered `parts` are top-level fields. Every part entry requires `filename`, exact `size`, lowercase SHA-256, and lowercase MD5. Part filenames must match the original filename and zero-based sequence; count and sizes must cover the whole stream exactly. The included disk map must exactly cover configured non-CD-ROM disks.
+
+During production, at most `transfers + 1` part files occupy `stage/spool/`, including the part currently being written. Each completed part is atomically renamed from `.partial`, independently hashed from disk, uploaded, and verified against its original MD5 in Drive. Only verified parts are deleted locally, releasing space for production. Records for uploaded parts remain in the in-memory stream inventory until successful production writes the manifest and receipt. Metadata memory scales with part count, not payload size. There is no concatenated local VMA upload file.
+
+Only successful producer and zstd-check exits, a nonempty stream, matching VM configuration, and a complete vzdump disk inventory permit the durable `stream-complete.json` receipt. The receipt stores the exact manifest SHA-256 and may precede completion of the last concurrent uploads. Recovery combines receipt-listed remote parts with any remaining local spool files, never a newly generated compressed prefix. If production is interrupted before certification, a new attempt is required and the old one remains incomplete. The normal upload command marks that old attempt `SUPERSEDED`, retains it for guarded cleanup, and starts a new UUID attempt. This is deliberately different from resuming completed native files.
+
+Finalization verifies every remote part against receipt-bound size/MD5, uploads and reads back the manifest, and publishes and reads back `COMPLETE`. Matching source configuration and backup lock are required before publication and again before deletion. Restore uses the same ordered SHA-256 reconstruction rules as native multipart, then validates zstd and invokes qmrestore only after the reconstructed compressed file passes its whole-file check. Checksums and existing legacy readers are unchanged.

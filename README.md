@@ -57,19 +57,13 @@ The example archives VM `100` to `gdrive:pve-archive` under source identifier `p
 
 **Without `--keep-vm`, a successful upload deletes the source VM and its disks after verification.**
 
-For VMs without snapshots, `--stream` uploads directly without creating a local archive:
+VMs without snapshots automatically use compressed VMA streaming with parallel Google Drive uploads. The default upload spool is bounded to 2.25 GiB, with 1 GiB of additional free-space headroom required; it does not stage the VM's full QCOW2 files. No `--stream` option is needed.
 
-```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --stream --keep-vm
-```
+VMs with supported internal QCOW2 snapshots retain exact native disk bytes and Proxmox snapshot configuration. Native upload still needs staging equal to the original QCOW2 file lengths.
 
-Streaming requires a remote with streaming upload and MD5 support, such as Google Drive. Interrupted transfers restart from the beginning. Native QCOW2 snapshot archives require staging.
+Both paths use eight concurrent transfers and 128 MiB Drive upload chunks. Native parts default to 4 GiB; compressed VMA parts default to 256 MiB so uploads can overlap promptly. Advanced tuning is under `upload --help`.
 
-Streaming upload progress shows an estimated maximum size and ETA based on configured disk capacities plus an overhead allowance. Compression can make the actual archive substantially smaller.
-
-Native QCOW2 archives automatically use parallel Google Drive transfers while preserving the exact disk bytes and supported internal snapshots. Defaults are 4 GiB parts, eight transfers, and 128 MiB upload chunks. Normal commands are unchanged; advanced tuning is available in `upload --help` and `restore --help`.
-
-Drive quota blocks are retried hourly up to 24 times. If interrupted, repeat the same upload command to resume one recorded unfinished multipart attempt. Keep its staging files and the source VM stopped and backup-locked. See [recovery and tuning](ADMIN.md), the [archive format](MULTIPART_FORMAT.md), and the [live benchmark procedure](BENCHMARK.md). Streaming VMA retains its existing 32 MiB default and restart behavior.
+Quota blocks retry hourly up to 24 times. Keep the process running to resume the same VMA stream after quota clears; production pauses when its spool fills. If interrupted after production completes, repeat the normal command to finish the remaining uploads. If production itself was interrupted, the command starts a new stream and retains the old incomplete attempt for `cleanup`. See [recovery and tuning](ADMIN.md), the [archive format](MULTIPART_FORMAT.md), and the [live benchmark procedure](BENCHMARK.md).
 
 ### List
 
@@ -96,7 +90,7 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 
 Restoration rejects occupied VM IDs and leaves the restored VM stopped. Guest static IP addresses are unaffected by `--unique`. The cloud archive is retained.
 
-Use `--stream` to restore a VMA archive without downloading a staging copy:
+For older single-file VMA archives, use `--stream` to restore without a staging copy. New multipart VMA archives use the normal restore command and stage compressed data for verification:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \

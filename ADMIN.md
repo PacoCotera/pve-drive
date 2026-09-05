@@ -4,7 +4,7 @@ For installation and everyday commands, see [README.md](README.md).
 
 ## Source identity and archive selection
 
-Run uploads on the VM’s owning node. Use a unique, stable `--source` label for each server; the tool does not enforce label ownership or connect to other nodes over SSH. A migrated VM may have older archives under its previous label.
+Run uploads on the VM's owning node. Use a unique, stable `--source` label for each server; the tool does not enforce label ownership or connect to other nodes over SSH. A migrated VM may have older archives under its previous label.
 
 Archives use `REMOTE/sources/SOURCE/VMID/TIMESTAMP-UUID/`. The manifest records the source label, actual node name, VM configuration, date, and checksums. A verified `COMPLETE` marker makes an archive eligible for listing and restore.
 
@@ -16,7 +16,7 @@ Cloud archives are retained after restore. There is no automatic remote pruning.
 
 ## Configuration and installation
 
-The default rclone configuration is `/root/.config/rclone/rclone.conf`; override it with `--rclone-config PATH` before the command. Shared Drives use rclone’s `team_drive` setting, not `shared_with_me`. A service account needs suitable Drive membership. See [rclone’s Drive documentation](https://rclone.org/drive/), including its OAuth client setup.
+The default rclone configuration is `/root/.config/rclone/rclone.conf`; override it with `--rclone-config PATH` before the command. Shared Drives use rclone's `team_drive` setting, not `shared_with_me`. A service account needs suitable Drive membership. See [rclone's Drive documentation](https://rclone.org/drive/), including its OAuth client setup.
 
 Crypt remotes require `--deep-verify` when they do not expose MD5. Preserve encryption keys and rclone configuration separately. Fast recovery requires remote MD5 support.
 
@@ -24,7 +24,7 @@ The installer places the executable at `/usr/local/sbin/pve-drive`. It preserves
 
 ## Space and staging
 
-Default staging is `/var/lib/vz/pve-drive`. Check free space before starting. Native QCOW2 archives are uncompressed and can exceed the guest’s virtual disk capacity because of snapshots. Upload staging requires the full disk-file lengths plus 1 GiB. Multipart restore staging requires twice the archive size plus 1 GiB for parts and reconstruction; destination storage needs another full disk copy. On one filesystem allow approximately three times the archive size plus headroom. Legacy native restore needs one staged copy and one destination copy. Sparse savings are not assumed.
+Default staging is `/var/lib/vz/pve-drive`. Check free space before starting. Native QCOW2 archives are uncompressed and can exceed the guest's virtual disk capacity because of snapshots. Upload staging requires the full disk-file lengths plus 1 GiB. Multipart restore staging requires twice the archive size plus 1 GiB for parts and reconstruction; destination storage needs another full disk copy. On one filesystem allow approximately three times the archive size plus headroom. Legacy native restore needs one staged copy and one destination copy. Sparse savings are not assumed.
 
 To stage a restore on a larger filesystem:
 
@@ -40,7 +40,7 @@ Successful `upload`, `restore`, and `recover` remove staging by default; `--keep
 
 ## Parallel native uploads and Drive quotas
 
-Native QCOW2 upload automatically splits each exact disk file into independent 4 GiB parts and sends eight files concurrently, using 128 MiB Drive upload chunks. There is no conversion, recompression, or snapshot flattening. VMA/native format selection is unchanged. Source deletion requires verified parts, manifest, completion marker, and an unchanged source. Older archives remain restorable. See [MULTIPART_FORMAT.md](MULTIPART_FORMAT.md) for schema 4 and [BENCHMARK.md](BENCHMARK.md) for the required live performance comparison; throughput improvement has not yet been measured on the actual Drive path.
+Native QCOW2 upload automatically splits each exact disk file into independent 4 GiB parts and sends eight files concurrently, using 128 MiB Drive upload chunks. There is no conversion, recompression, or snapshot flattening. Snapshot detection still selects native QCOW2; VMs without snapshots now use multipart compressed VMA. Source deletion requires verified parts, manifest, completion marker, and an unchanged source. Older archives remain restorable. See [MULTIPART_FORMAT.md](MULTIPART_FORMAT.md) for schema 4 and [BENCHMARK.md](BENCHMARK.md) for the required live performance comparison; throughput improvement has not yet been measured on the actual Drive path.
 
 The normal interface remains:
 
@@ -63,19 +63,40 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 
 Use the same selected backup, target options, remote, source, and work directory. Already downloaded parts are checked by SHA-256 and reused; incomplete or corrupted local parts are downloaded again. Reconstruction writes a temporary image and independently verifies its whole-file SHA-256 before any VM is created. After Proxmox allocation starts, inspect `restore-state.json` and the target instead of using this download-resume option.
 
-## Streaming upload and restore
+## Compressed multipart VMA: default without snapshots
 
-`upload VMID --stream` sends a zstd-compressed VMA directly from `vzdump --stdout` to `rclone rcat`. The relay uses bounded buffers, calculates SHA-256 and MD5, and feeds the same compressed bytes to `zstd --test`. It requires successful exits from all processes and checks that vzdump included every configured data disk. Cloud size and MD5 verification, manifest verification, and completion-marker read-back must succeed before source VM deletion.
+From 0.10.0, the normal `upload VMID` command selects multipart VMA streaming when the VM has no snapshots. `--stream` explicitly selects the same path. This avoids staging large raw QCOW2 files or a complete compressed archive. Supported snapshot VMs continue to use native QCOW2.
 
-Preflight requires the remote to advertise `PutStream` and MD5 support. Remotes that would spool an unknown-size upload to local disk are rejected. `--stream` cannot be combined with snapshots, `--resume`, or `--deep-verify`; use staged upload for those cases. Small logs, temporary Proxmox metadata, and recovery receipts remain under `--work-dir`. `--keep-local` retains these files, not an archive. Upload progress reports compressed bytes passed to the uploader, average rate, elapsed time, and an estimated maximum size/ETA. The estimate sums configured data-disk capacities, adds 2% plus 64 MiB for archive/compression overhead, and excludes CD-ROM media. It is a conservative estimate, not a guaranteed upper bound: configuration sizes may be stale. If any disk size is missing or invalid, the total remains unknown. Exceeding the estimate removes the ETA without interrupting the upload; exact restore-size validation is unaffected. Compression may allow completion far below the estimate. A successful uploader exit and metadata verification establish remote completion.
+The defaults are 256 MiB VMA parts, eight concurrent rclone upload processes, and 128 MiB Drive upload chunks. Each process transfers one independent part. A nine-slot spool bounds part-file storage to 2.25 GiB; preflight requires 3.25 GiB free including 1 GiB of headroom. The spool limit is `(transfers + 1) × part_size`, plus headroom. `--part-size`, `--transfers`, and `--drive-chunk-size` override these values; native QCOW2 retains its separate 4 GiB default. Eight Drive upload buffers use about 1 GiB of RAM plus process overhead. Diagnostic logs and vzdump temporary metadata are additional to the payload spool budget.
 
-`restore VMID --stream` supports both staged and streamed VMA archives, including older versions. It reads the verified manifest and checks the remote archive size before creating the VM; when the manifest includes MD5, that must match remote metadata too. Incoming compressed bytes are hashed, decompressed, and passed to `qmrestore` through pipes. SHA-256 and size must match before completion. No local archive is created. Native QCOW2 archives still require staged restoration to preserve internal snapshots. Destination storage must accommodate the restored disks; eliminating staging does not reduce that requirement.
+Vzdump produces the ordinary compressed VMA stream with its existing compression settings. The stream is simultaneously checked by zstd, split, hashed, and uploaded. Each complete part is SHA-256/MD5 verified locally and size/MD5 verified on Drive before its spool slot is released and its local file deleted. `--deep-verify` additionally reads each part back while it is still local. `--keep-local` keeps metadata and any remaining recovery files, not uploaded part copies. Console progress counts successfully uploaded and verified compressed bytes, rather than bytes merely produced into the spool; before production finishes, the maximum-size estimate still derives from configured virtual capacity.
+
+On recognized quota errors, workers retry hourly up to 24 times. Their slots stay occupied, so production pauses via pipe backpressure while the disk budget remains bounded. Keep the process running to continue the exact same stream after the quota resets. Ctrl-C cancels worker retries and stops the vzdump producer; it does not leave background upload threads running indefinitely. `--quota-retries 0` exits immediately with recovery data intact.
+
+There are two recovery cases:
+
+- **Production completed successfully:** a durable receipt binds the whole compressed SHA-256, ordered parts, included-disk inventory, and VM configuration. Repeat the normal upload command to send remaining local parts, verify all remote parts, and finish publication. Already verified remote parts are reused. `recover VMID --resume PATH` verifies and finalizes an already uploaded attempt without sending part data, and always retains the VM.
+- **Production was interrupted:** a VMA prefix cannot safely be extended with a new vzdump stream because its timestamps and headers can differ. Without a completion receipt, repeat the normal upload command to start a new attempt. The previous attempt is marked superseded and retained for `cleanup VMID`; it never appears complete. If vzdump left a VM lock, inspect the process/VM state before unlocking and restarting. The tool does not bypass an uncertain source lock.
+
+The source stays under vzdump's backup lock during production, including quota waits; pve-drive acquires its ordinary backup lock after successful production. Producer/checker failure, missing disk inventory, part corruption, manifest mismatch, or marker failure prevents source deletion. No `COMPLETE` marker is published until the entire archive has passed verification.
+
+Normal `restore VMID` downloads schema 5 compressed parts in parallel, reconstructs the compressed VMA, verifies every part plus the complete reconstructed file, and runs `zstd --test` before `qmrestore`. Restore staging needs twice the **compressed** archive size plus 1 GiB; destination VM storage is separate. `restore ... --resume PATH` reuses SHA-256-verified downloads after interruption. New multipart VMA archives require 0.10.0 or newer on the restore node. All schema 1-4 archives remain supported. `--stream` restore remains a legacy single-file option.
+
+For throughput comparisons, `upload VMID --stream --single-file --keep-vm` selects the old single-file VMA stream. Advanced `archive --format vzdump` retains the old full-staging path unless `--stream` is selected. Routine administration does not need either option.
+
+## Legacy single-file streaming upload and restore
+
+`upload VMID --stream --single-file` sends a zstd-compressed VMA directly from `vzdump --stdout` to `rclone rcat`. The relay uses bounded buffers, calculates SHA-256 and MD5, and feeds the same compressed bytes to `zstd --test`. It requires successful exits from all processes and checks that vzdump included every configured data disk. Cloud size and MD5 verification, manifest verification, and completion-marker read-back must succeed before source VM deletion.
+
+Preflight requires the remote to advertise `PutStream` and MD5 support. Remotes that would spool an unknown-size upload to local disk are rejected. Legacy `--stream --single-file` cannot be combined with snapshots, `--resume`, or `--deep-verify`. The default multipart VMA stream supports per-part deep verification and completed-production recovery. Small logs, temporary Proxmox metadata, and recovery receipts remain under `--work-dir`. `--keep-local` retains these files, not an archive. Upload progress reports compressed bytes passed to the uploader, average rate, elapsed time, and an estimated maximum size/ETA. The estimate sums configured data-disk capacities, adds 2% plus 64 MiB for archive/compression overhead, and excludes CD-ROM media. It is a conservative estimate, not a guaranteed upper bound: configuration sizes may be stale. If any disk size is missing or invalid, the total remains unknown. Exceeding the estimate removes the ETA without interrupting the upload; exact restore-size validation is unaffected. Compression may allow completion far below the estimate. A successful uploader exit and metadata verification establish remote completion.
+
+`restore VMID --stream` supports legacy single-file staged and streamed VMA archives. Schema 5 multipart VMA restores use the normal staged verification path. It reads the verified manifest and checks the remote archive size before creating the VM; when the manifest includes MD5, that must match remote metadata too. Incoming compressed bytes are hashed, decompressed, and passed to `qmrestore` through pipes. SHA-256 and size must match before completion. No local archive is created. Native QCOW2 archives still require staged restoration to preserve internal snapshots. Destination storage must accommodate the restored disks; eliminating staging does not reduce that requirement.
 
 Streaming restore writes destination disks before the final SHA-256 result is available. The target is never automatically started. Successful restoration disables onboot; a final checksum mismatch leaves the target backup-locked. Other failures can leave partial disks or a Proxmox restore lock. Inspect `restore-state.json`, the logs, and the target VM before removing a failed target and retrying. The script does not overwrite an occupied VM ID or delete partial restore disks automatically. Cloud archives are retained.
 
 ### Interrupted streams
 
-For Google Drive, `upload VMID --stream --drive-chunk-size 128M` overrides the default 32 MiB upload chunks. Supported values are `8M`, `16M`, `32M`, `64M`, `128M`, and `256M`. Chunk buffers consume RAM; larger chunks may reduce request overhead but do not guarantee higher throughput. The option also tunes native uploads (default 128M); it does not affect compression and cannot change an active transfer. Compare sustained rates while keeping other settings unchanged.
+For Google Drive, `upload VMID --stream --single-file --drive-chunk-size 128M` overrides the default 32 MiB upload chunks. Supported values are `8M`, `16M`, `32M`, `64M`, `128M`, and `256M`. Chunk buffers consume RAM; larger chunks may reduce request overhead but do not guarantee higher throughput. The option also tunes native uploads (default 128M); it does not affect compression and cannot change an active transfer. Compare sustained rates while keeping other settings unchanged.
 
 Version 0.8.1 fixes an SSH-terminal startup failure in streaming upload (`failed to tcsetpgrp`, followed by zstd `unexpected end of file`). Update before retrying an affected attempt. This failure occurs before backup data is produced; it cannot be finalized with `recover`.
 
@@ -111,7 +132,7 @@ VMs, allocated VM disks, VM locks, and `/var/log/pve-drive` logs are never delet
 | No snapshots | zstd-compressed VMA via `vzdump`, restored with `qmrestore` |
 | Supported snapshots | Native QCOW2 files and full VM/snapshot configuration |
 
-Native mode requires VM-owned standalone QCOW2 files on directory storage, with identical disk attachments across snapshot sections. Each disk’s internal snapshot names must match Proxmox’s snapshot configuration. Backing chains, external data files, encryption, saved RAM, raw disks, cloud-init disks, and changing snapshot disk attachments are rejected. Native archives must be restored by this script, not the Proxmox VMA backup UI.
+Native mode requires VM-owned standalone QCOW2 files on directory storage, with identical disk attachments across snapshot sections. Each disk's internal snapshot names must match Proxmox's snapshot configuration. Backing chains, external data files, encryption, saved RAM, raw disks, cloud-init disks, and changing snapshot disk attachments are rejected. Native archives must be restored by this script, not the Proxmox VMA backup UI.
 
 Native copying reads bytes sequentially, preserves zero-filled regions as sparse output, flushes the destination, and checks SHA-256. It does not convert QCOW2 images or use reflinks/copy offloading.
 
@@ -125,7 +146,7 @@ Use a maintenance window: do not start, modify, migrate, unlock, or replace a VM
 
 ## Verification
 
-By default, upload compares every payload file’s size and MD5 with remote metadata. Missing/malformed hashes, mismatches, missing/extra files, or duplicate paths fail before the completion marker or VM deletion. There is no size-only fallback. This reads local files for hashing but does not download the archive again.
+By default, upload compares every payload file's size and MD5 with remote metadata. Missing/malformed hashes, mismatches, missing/extra files, or duplicate paths fail before the completion marker or VM deletion. There is no size-only fallback. This reads local files for hashing but does not download the archive again.
 
 For an independent read of stored bytes, or a remote without MD5, select full read-back at upload time:
 
@@ -162,9 +183,9 @@ On success, the archive becomes available to `list`/`restore`, and the VM is ret
 
 ### Other failures
 
-Incomplete remote folders without `COMPLETE` are ignored by listing and automatic restore. Rclone retries transient errors within an operation. Multipart uploads reuse a recorded unfinished attempt; other fresh uploads create a new version. Multipart downloads and reconstruction can resume with `restore ... --resume STAGING_DIR`, before VM creation.
+Incomplete remote folders without `COMPLETE` are ignored by listing and automatic restore. Rclone retries transient errors within an operation. Native multipart and fully produced VMA uploads reuse a recorded unfinished attempt; interrupted VMA production restarts a new version. Multipart downloads and reconstruction can resume with `restore ... --resume STAGING_DIR`, before VM creation.
 
-Interrupted native restores may leave a create-locked placeholder VM and allocated disks. Staging’s `restore-state.json` records allocations, including disks that may not yet be attached. Inspect before cleanup; do not simply unlock and start the placeholder. VMA restore failures can also leave partial VMs. The script does not automatically delete these allocations and will refuse to overwrite the VMID on retry.
+Interrupted native restores may leave a create-locked placeholder VM and allocated disks. Staging's `restore-state.json` records allocations, including disks that may not yet be attached. Inspect before cleanup; do not simply unlock and start the placeholder. VMA restore failures can also leave partial VMs. The script does not automatically delete these allocations and will refuse to overwrite the VMID on retry.
 
 If only final cleanup failed, the operation may already have succeeded. Inspect state before retrying. Manually remove partial local/remote copies only after confirming what they contain. To abandon a failed operation, unlock manually only after all related tasks have stopped and the VM state has been checked.
 
