@@ -1,6 +1,6 @@
 # pve-drive
 
-Move Proxmox QEMU VMs to Google Shared Drive using rclone, and restore them by VMID. Version **0.7.0**.
+Move Proxmox QEMU VMs to Google Shared Drive using rclone, and restore them by VMID. Version **0.7.1**.
 
 **Status: experimental.** Automated tests cover simulated lifecycle failures and local copying, but end-to-end Proxmox/Drive restore and snapshot rollback validation is still in progress. Test with `--keep-vm` before using this tool to delete a VM.
 
@@ -252,3 +252,7 @@ requires a separate upload; it cannot be marked complete by this command.
 ```bash
 pve-drive recover --help
 ```
+
+## Archive listing
+
+`list` displays VMID, NAME, SIZE, FORMAT, SNAPSHOTS, and ARCHIVED UTC in aligned columns. SIZE is the recorded archive size from the manifest, including native snapshot data; it is not the guest virtual disk capacity or Drive quota usage. No extra Drive requests are needed for size. The command displays "Loading cloud archives..." while fetching metadata, then prints the complete table. `--all-versions` also shows BACKUP ID.

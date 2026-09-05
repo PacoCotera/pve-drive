@@ -1,4 +1,4 @@
-# Admin quick start — version 0.7.0
+# Admin quick start — version 0.7.1
 
 **Experimental:** complete a test upload, restore, and snapshot rollback before relying on VM deletion. Use `--keep-vm` for the first upload.
 
@@ -157,3 +157,7 @@ requires a separate upload; it cannot be marked complete by this command.
 ```bash
 pve-drive recover --help
 ```
+
+## Archive listing
+
+`list` displays VMID, NAME, SIZE, FORMAT, SNAPSHOTS, and ARCHIVED UTC in aligned columns. SIZE is the recorded archive size from the manifest, including native snapshot data; it is not the guest virtual disk capacity or Drive quota usage. No extra Drive requests are needed for size. The command displays "Loading cloud archives..." while fetching metadata, then prints the complete table. `--all-versions` also shows BACKUP ID.

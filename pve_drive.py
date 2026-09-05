@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.7.0'
+__version__ = '0.7.1'
 
 
 def duration(seconds):
@@ -761,6 +761,7 @@ class Manager:
         console.note(f'Restored VM {ident}, stopped with onboot disabled. Drive backup retained.')
 
     def listing(self):
+        console.stage('Loading cloud archives...')
         rows = json.loads(self.rc('lsjson', self.base, '--recursive', '--files-only', capture=True))
         complete = sorted(x['Path'][:-9] for x in rows if x['Path'].endswith('/COMPLETE'))
         if not getattr(self.a, 'all_versions', False):
@@ -769,14 +770,26 @@ class Manager:
                 backup_id(bid)
                 latest[bid.split('/')[0]] = bid
             complete = list(latest.values())
-        print('VMID\tNAME\tFORMAT\tSNAPSHOTS\tARCHIVED UTC' +
-              ('\tBACKUP ID' if getattr(self.a, 'all_versions', False) else ''))
+        headers = ['VMID', 'NAME', 'SIZE', 'FORMAT', 'SNAPSHOTS', 'ARCHIVED UTC']
+        all_versions = getattr(self.a, 'all_versions', False)
+        if all_versions:
+            headers.append('BACKUP ID')
+        table = [headers]
         for bid in complete:
             _, m = self.manifest(bid)
             kind = m.get('format', 'vzdump')
             history = ','.join(m.get('snapshots', [])) or '-'
-            print(f"{m['vmid']}\t{m.get('config', {}).get('name', '')}\t{kind}\t{history}\t{m.get('created_utc', '')}" +
-                  (f'\t{bid}' if getattr(self.a, 'all_versions', False) else ''))
+            row = [str(m['vmid']), m.get('config', {}).get('name', ''), human_bytes(m['size']),
+                   kind, history, m.get('created_utc', '')]
+            if all_versions:
+                row.append(bid)
+            table.append(row)
+        console.clear()
+        widths = [max(len(row[i]) for row in table) for i in range(len(headers))]
+        for row in table:
+            print('  '.join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+        if not complete:
+            console.note('No complete cloud archives found')
 
     def verify(self):
         stage, _ = self.download()
@@ -1116,7 +1129,7 @@ def parser():
     r.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain downloaded files after success (default: remove them)')
     r.add_argument('--cleanup-local', action='store_true', help=argparse.SUPPRESS)
     listing = sub.add_parser('list', help='List latest complete cloud archive for each source VM',
-                            description='List VMID, VM name, format, snapshots and UTC archive date for the selected --source. '
+                            description='List VMID, VM name, archived size, format, snapshots and UTC archive date for the selected --source. '
                                         'Incomplete uploads are omitted. Use --all-versions to include older versions and their backup IDs.')
     listing.add_argument('--all-versions', action='store_true', help='Show older versions and internal backup IDs')
     v = sub.add_parser('verify', help='Advanced: download and check an explicit backup ID',
