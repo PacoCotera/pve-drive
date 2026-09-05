@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run simulated lifecycle tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Check command help
+        run: |
+          python3 pve_drive.py --help
+          python3 pve_drive.py upload --help
+          python3 pve_drive.py restore --help
