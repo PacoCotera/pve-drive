@@ -1,8 +1,10 @@
 # Admin quick start — version 0.4.3
 
+**Experimental:** complete a test upload, restore, and snapshot rollback before relying on VM deletion. Use `--keep-vm` for the first upload.
+
 ## Install and update
 
-Clone once into a separate source directory (authenticate to the private repository when prompted):
+Clone once into a separate source directory:
 
 ```bash
 git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive &&
@@ -73,4 +75,4 @@ Use the exact staging directory printed by your failed operation. Leave the VM s
 
 ## Built-in help
 
-Run `pve-drive --help`, `pve-drive upload --help`, `pve-drive list --help`, or `pve-drive restore --help` for examples and defaults. Global options go before the command. For this private repository, use a GitHub personal access token at the Git password prompt, not your account password. Wait for active uploads/restores to finish before running the installer.
+Run `pve-drive --help`, `pve-drive upload --help`, `pve-drive list --help`, or `pve-drive restore --help` for examples and defaults. Global options go before the command. Wait for active uploads/restores to finish before running the installer.

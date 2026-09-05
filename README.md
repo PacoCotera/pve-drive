@@ -2,11 +2,13 @@
 
 Move Proxmox QEMU VMs to Google Shared Drive using rclone, and restore them by VMID. Version **0.4.3**.
 
+**Status: experimental.** Automated tests cover simulated lifecycle failures and local copying, but end-to-end Proxmox/Drive restore and snapshot rollback validation is still in progress. Test with `--keep-vm` before using this tool to delete a VM.
+
 The routine commands are **upload**, **list**, and **restore**. Internal backup IDs and archive formats are handled automatically. [ADMIN.md](ADMIN.md) is the short admin guide.
 
 ## Install and update
 
-Run on the Proxmox server. The repository is private: use a GitHub personal access token at the HTTPS password prompt, not your account password. A fine-grained token limited to this repository with Contents read-only is sufficient for cloning/pulling. See [GitHub authentication instructions](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
+Run on the Proxmox server. Clone the repository, then install the standalone command:
 
 ```bash
 git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive &&
@@ -165,3 +167,7 @@ pve-drive verify --help
 ```
 
 From the source checkout, run `python3 -m unittest discover -s tests -v`. Tests include simulated Proxmox/rclone failure paths, real local sparse-file copies, resume guards, and installer rollback. They do not execute real VM deletion. GitHub Actions also checks installation and help on Linux. End-to-end Proxmox/Drive restore validation is still required.
+
+## License
+
+MIT License, copyright (c) 2026 Paco Cotera. See [LICENSE](LICENSE). Proxmox, QEMU, rclone, and other external dependencies retain their own licenses.
