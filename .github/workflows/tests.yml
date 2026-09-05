@@ -20,3 +20,9 @@ jobs:
           python3 pve_drive.py --help
           python3 pve_drive.py upload --help
           python3 pve_drive.py restore --help
+      - name: Check installer on Linux
+        run: |
+          sh -n install.sh
+          sudo ./install.sh
+          /usr/local/sbin/pve-drive --version
+          sudo ./install.sh

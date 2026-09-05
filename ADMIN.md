@@ -1,11 +1,30 @@
 # Admin quick start — version 0.4.2
 
-Copy `pve_drive.py` onto the Proxmox server. Keep using the same configured rclone remote and a unique source label for each server.
+## Install and update
+
+Clone once into a separate source directory (authenticate to the private repository when prompted):
+
+```bash
+git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive
+cd /opt/pve-drive
+sudo ./install.sh
+```
+
+For later updates:
+
+```bash
+cd /opt/pve-drive
+git pull --ff-only && sudo ./install.sh
+```
+
+The installed command is `/usr/local/sbin/pve-drive`. If that path is an old directory, the installer preserves it as `pve-drive.previous-<timestamp>-<suffix>` before installing the executable. VM disks, staging files, and rclone configuration are not moved. An active pve-drive task blocks installation until it finishes. The installer does not install dependencies: Git and Python 3 must already be available, along with rclone and the normal Proxmox tools for operation.
+
+Keep using the same configured rclone remote and a unique source label for each server. Run `pve-drive --help` for usage.
 
 ## Upload VM 100 and remove it from Proxmox
 
 ```bash
-python3 pve_drive.py --remote gdrive:pve-archive --source pve-site-a upload 100
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100
 ```
 
 The VM is shut down, archived, uploaded, and verified before deletion. Internal QCOW2 snapshots are preserved automatically for the supported directory-storage layout. Unsupported snapshot layouts stop with an error instead of discarding history. Add `--keep-vm` for a test upload that leaves the original VM stopped on the server.
@@ -13,7 +32,7 @@ The VM is shut down, archived, uploaded, and verified before deletion. Internal 
 ## List cloud VMs
 
 ```bash
-python3 pve_drive.py --remote gdrive:pve-archive --source pve-site-a list
+pve-drive --remote gdrive:pve-archive --source pve-site-a list
 ```
 
 Shows VMID, name, archive format, snapshot names, and archive date for the latest complete version of each VM. Internal backup IDs are hidden unless you request `list --all-versions`.
@@ -21,7 +40,7 @@ Shows VMID, name, archive format, snapshot names, and archive date for the lates
 ## Restore VM 100
 
 ```bash
-python3 pve_drive.py --remote gdrive:pve-archive --source pve-site-a restore 100
+pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
 ```
 
 Selects the latest complete archive automatically, restores as VM 100 using its original storage, and leaves it stopped for inspection. It refuses to overwrite an existing VM. The cloud copy remains available. Start it when ready with `qm start 100`.
@@ -29,7 +48,7 @@ Selects the latest complete archive automatically, restores as VM 100 using its 
 To restore source VM 100 as VM 200, including on a different PVE server:
 
 ```bash
-python3 pve_drive.py --remote gdrive:pve-archive --source pve-site-a \
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
   restore 100 --target-vmid 200 --storage destination-dir --unique
 ```
 
@@ -46,7 +65,7 @@ Version 0.4.2 uses sequential reads/writes instead of accelerated `cp`. It verif
 After updating the script, a failed native copy from before manifest creation can reuse its existing staging directory:
 
 ```bash
-python3 pve_drive.py --remote gdrive:pve-archive --source pve-site-a \
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
   upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm
 ```
 

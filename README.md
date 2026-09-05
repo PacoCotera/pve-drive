@@ -35,12 +35,22 @@ Native mode currently requires directory storage, VM-owned standalone QCOW2 file
 
 On native restore failure, keep the create lock while inspecting the partial VM and the staging directory's `restore-state.json`. That file records allocated destination volumes, which may not yet be attached to the placeholder VM. Do not merely unlock and start a partial restore. No automatic cleanup of partially allocated disks is attempted. The remote archive and downloaded files remain available. Native restore writes the complete Proxmox configuration after reserving the VMID; as with archive, no other task or administrator should change that VM during the operation.
 
-## Install and configure
-
-Copy `pve_drive.py` to `/usr/local/sbin/pve-drive` on the Proxmox node and run:
+## Install and update from Git
 
 ```bash
-chmod 700 /usr/local/sbin/pve-drive
+git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive
+cd /opt/pve-drive
+sudo ./install.sh
+```
+
+Update with `cd /opt/pve-drive && git pull --ff-only && sudo ./install.sh`.
+The installer places the executable at `/usr/local/sbin/pve-drive`, preserves an old directory at that path under a timestamped backup name, and blocks upgrades during active operations. Source and installed executable are separate. See [ADMIN.md](ADMIN.md) for normal command usage.
+
+## Dependencies and rclone configuration
+
+Install from Git as above. Install dependencies and configure rclone on the Proxmox node:
+
+```bash
 apt-get update
 apt-get install python3 rclone zstd
 rclone config
