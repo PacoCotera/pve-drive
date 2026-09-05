@@ -1,4 +1,4 @@
-# Admin quick start — version 0.6.0
+# Admin quick start — version 0.7.0
 
 **Experimental:** complete a test upload, restore, and snapshot rollback before relying on VM deletion. Use `--keep-vm` for the first upload.
 
@@ -123,3 +123,37 @@ Metadata verification detects transfer corruption but is not an independent read
 of the stored bytes. Use deep verification when that additional check is wanted.
 This change removes the default verification download; it does not accelerate the
 upload itself. An already running operation keeps its original verification mode.
+
+## Recover an upload interrupted during verification
+
+If the archive files reached Drive but verification was interrupted, use `recover`
+on the original PVE node with the original source label and exact staging path:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  recover 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE
+```
+
+Stop the original pve-drive operation first. Leave the VM stopped and backup-locked;
+do not manually unlock it. The command requires the saved manifest and complete
+local payload. It validates the source/node/VM identity, saved configuration,
+local SHA-256 hashes, disk integrity, and remote file sizes/MD5 hashes. SHA-256 and
+MD5 are computed together in one local read. It does not recopy disks, reupload
+archive files, or download the archive. Only the small completion marker is
+uploaded and read back. Both native QCOW2 and VMA archives are supported.
+
+On success the cloud backup becomes available to `list` and `restore`, and the
+original VM is retained, stopped, and unlocked. Recovery never deletes a VM.
+Staging is retained by default; append `--cleanup-local` to remove it after success.
+Missing/corrupt files, wrong source/node/configuration, unavailable MD5, or a failed
+marker write leave recovery incomplete and the VM locked. A retry accepts an
+already published matching marker if the VM still holds its backup lock.
+
+`upload --resume` repairs a failed local copy before a manifest exists;
+`recover --resume` finalizes an existing upload after a manifest exists. Recovery
+does not upload missing files or bypass verification. An incomplete cloud payload
+requires a separate upload; it cannot be marked complete by this command.
+
+```bash
+pve-drive recover --help
+```

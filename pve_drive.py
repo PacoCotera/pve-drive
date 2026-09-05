@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.6.0'
+__version__ = '0.7.0'
 
 
 def duration(seconds):
@@ -196,21 +196,25 @@ def run(*args, capture=False):
 
 def file_hash(path, algorithm='sha256'):
     h = hashlib.md5(usedforsecurity=False) if algorithm == 'md5' else hashlib.sha256()
+    md5 = hashlib.md5(usedforsecurity=False) if algorithm == 'both' else None
     total = Path(path).stat().st_size
     show = total >= 64 * 1024 * 1024
     if show:
-        console.stage(f'Computing {algorithm.upper()}: {Path(path).name}')
+        label = 'SHA-256 + MD5' if algorithm == 'both' else algorithm.upper()
+        console.stage(f'Computing {label}: {Path(path).name}')
     done = 0
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(8 * 1024 * 1024), b''):
             h.update(chunk)
+            if md5 is not None:
+                md5.update(chunk)
             done += len(chunk)
             if show:
                 console.update(done, total)
     if show:
         console.update(done, total, force=True)
         console.clear()
-    return h.hexdigest()
+    return (h.hexdigest(), md5.hexdigest()) if md5 is not None else h.hexdigest()
 
 
 def sha256(path):
@@ -424,7 +428,7 @@ class Manager:
             raise ValueError('Use a named rclone remote with a dedicated folder, e.g. gdrive:pve-archive')
         if args.source:
             self.base += '/sources/' + source_name(args.source)
-        elif args.command in ('archive', 'upload', 'move-to-cloud', 'move-from-cloud'):
+        elif args.command in ('archive', 'upload', 'move-to-cloud', 'move-from-cloud', 'recover'):
             raise ValueError('Archiving requires --source; legacy layout is read-only')
         self.work = Path(args.work_dir).resolve()
 
@@ -447,7 +451,7 @@ class Manager:
     def api(self, path):
         return json.loads(run('pvesh', 'get', path, '--output-format', 'json', capture=True))
 
-    def verify_upload(self, payload, destination):
+    def verify_upload(self, payload, destination, local_checks=None, completion_hash=None):
         if getattr(self.a, 'deep_verify', False):
             self.rc('check', payload, destination, '--download')
             return
@@ -455,7 +459,7 @@ class Manager:
         # when a remote does not expose a compatible checksum.
         console.stage('Computing local MD5 checksums')
         local = {}
-        for path in sorted(Path(payload).rglob('*')):
+        for path in ([] if local_checks is not None else sorted(Path(payload).rglob('*'))):
             if path.is_symlink():
                 raise ValueError('Refusing symlink in upload payload')
             if not path.is_file():
@@ -465,6 +469,8 @@ class Manager:
             if file_details(path) != before:
                 raise ValueError('Upload payload changed while hashing')
             local[path.relative_to(payload).as_posix()] = (before['size'], digest)
+        if local_checks is not None:
+            local = dict(local_checks)
         if not local:
             raise ValueError('Upload payload is empty')
         console.stage('Comparing cloud file sizes and MD5 checksums')
@@ -480,6 +486,9 @@ class Manager:
                 raise ValueError(f'Cloud MD5 unavailable for {name}; verification failed. '
                                  'Use --deep-verify for remotes without MD5 support.')
             remote[name] = (row.get('Size'), digest.lower())
+        if completion_hash is not None and 'COMPLETE' in remote:
+            marker_bytes = (completion_hash + '\n').encode('ascii')
+            local['COMPLETE'] = (len(marker_bytes), hashlib.md5(marker_bytes, usedforsecurity=False).hexdigest())
         if set(remote) != set(local):
             raise ValueError('Cloud file listing differs from upload payload')
         for name, expected in local.items():
@@ -582,7 +591,7 @@ class Manager:
                     'sha256': sha256(archive), 'config': cfg}
         (payload / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         self.rc('copy', payload, destination, '--immutable')
-        # Full read-back; no reliance on size-only comparisons or backend hashes.
+        # Require cloud hashes by default, or explicit full read-back.
         self.verify_upload(payload, destination)
         marker = stage / 'COMPLETE'
         marker.write_text(sha256(payload / 'manifest.json') + '\n')
@@ -610,6 +619,10 @@ class Manager:
         if hashlib.sha256(raw.encode()).hexdigest() != marker:
             raise ValueError('Manifest checksum mismatch or incomplete backup')
         m = json.loads(raw)
+        self.validate_manifest(m, bid)
+        return destination, m
+
+    def validate_manifest(self, m, bid):
         expected_schemas = (2, 3) if self.a.source else (1,)
         if m.get('schema') not in expected_schemas or m.get('backup_id') != bid or str(m.get('vmid')) != bid.split('/')[0]:
             raise ValueError('Invalid manifest identity/schema')
@@ -617,12 +630,97 @@ class Manager:
             raise ValueError('Manifest source does not match selected source')
         if m['schema'] == 3:
             self.validate_native_manifest(m)
-            return destination, m
+            return
         if not re.fullmatch(r'vzdump-qemu-[0-9]+-[A-Za-z0-9_-]+\.vma\.zst', m.get('filename', '')):
             raise ValueError('Unsafe archive filename')
         if not re.fullmatch(r'[a-f0-9]{64}', m.get('sha256', '')) or not isinstance(m.get('size'), int) or m['size'] <= 0:
             raise ValueError('Invalid archive checksum/size')
-        return destination, m
+
+    def recover(self):
+        ident = vmid(self.a.vmid)
+        requested = Path(self.a.resume)
+        stage = requested.resolve()
+        if (requested.is_symlink() or stage.parent != self.work or
+                not stage.name.startswith((f'native-{ident}-', f'archive-{ident}-'))):
+            raise ValueError('Recovery requires this VM staging directory directly under --work-dir')
+        payload = stage / 'payload'
+        if not payload.is_dir() or payload.is_symlink():
+            raise ValueError('Invalid recovery payload directory')
+        for path in payload.iterdir():
+            if path.is_symlink() or not path.is_file():
+                raise ValueError('Recovery payload must contain only regular files')
+        manifest_path = payload / 'manifest.json'
+        manifest_bytes = manifest_path.read_bytes()
+        m = json.loads(manifest_bytes)
+        bid = backup_id(m.get('backup_id', ''))
+        self.validate_manifest(m, bid)
+        if str(m['vmid']) != ident or m.get('source_node') != Path('/etc/pve/local').resolve().name:
+            raise ValueError('Recovery VM/node does not match the staged archive')
+        cfg = self.config(ident)
+        if cfg.get('lock') != 'backup':
+            raise ValueError('Recovery requires the original stopped VM with its backup lock')
+        expected = dict(m['config'], lock='backup')
+        self.unchanged(ident, expected.copy())
+        native_raw = None
+        if m['schema'] == 3:
+            native_raw = (payload / 'vm.conf').read_text()
+            sections = parse_native_config(native_raw)
+            if (native_volumes(sections, ident) != {d['device']: d['volume'] for d in m['disks']} or
+                    set(sections) - {'current'} != set(m['snapshots'])):
+                raise ValueError('Recovery manifest/configuration mismatch')
+            files = {d['filename']: (d['size'], d['sha256']) for d in m['disks']}
+            files['vm.conf'] = (None, m['config_sha256'])
+        else:
+            files = {m['filename']: (m['size'], m['sha256'])}
+        if {p.name for p in payload.iterdir()} != set(files) | {'manifest.json'}:
+            raise ValueError('Unexpected or missing recovery payload files')
+        marker = stage / 'COMPLETE'
+        if marker.is_symlink() or (marker.exists() and not marker.is_file()):
+            raise ValueError('Invalid local completion marker')
+        def check_vm():
+            self.unchanged(ident, expected.copy())
+            if native_raw is not None and re.sub(r'^lock: backup\n', '', self.config_file(ident).read_text(), flags=re.M) != native_raw:
+                raise ValueError('VM snapshot configuration differs from staged archive')
+        check_vm()
+        console.note(f'Recovering uploaded archive for VM {ident}; VM will be retained')
+        # One local read computes both hashes. No copying, uploading disk files,
+        # or downloading archive contents is needed for recovery.
+        local_checks, states = {}, {}
+        for name in sorted(set(files) | {'manifest.json'}):
+            path = payload / name
+            states[name] = file_details(path)
+            sha, md5 = file_hash(path, 'both')
+            if file_details(path) != states[name]:
+                raise ValueError('Recovery payload changed while hashing')
+            if name in files:
+                size, expected_sha = files[name]
+                if sha != expected_sha or (size is not None and states[name]['size'] != size):
+                    raise ValueError(f'Recovery SHA-256/size mismatch: {name}')
+            else:
+                manifest_sha = sha
+                if sha != hashlib.sha256(manifest_bytes).hexdigest():
+                    raise ValueError('Recovery manifest changed during validation')
+            local_checks[name] = (states[name]['size'], md5)
+        if m['schema'] == 3:
+            for d in m['disks']:
+                if self.qcow_info(payload / d['filename'], m['snapshots'])['virtual-size'] != d['virtual_size']:
+                    raise ValueError('Recovery disk virtual size mismatch')
+        else:
+            run('zstd', '--test', payload / m['filename'])
+        destination = self.base + '/' + bid
+        self.verify_upload(payload, destination, local_checks=local_checks, completion_hash=manifest_sha)
+        check_vm()
+        if any(file_details(payload / name) != state for name, state in states.items()):
+            raise ValueError('Recovery payload changed during verification')
+        marker.write_bytes((manifest_sha + '\n').encode('ascii'))
+        self.rc('copyto', marker, destination + '/COMPLETE', '--immutable')
+        if self.rc('cat', destination + '/COMPLETE', capture=True) != marker.read_text():
+            raise ValueError('Completion marker verification failed')
+        check_vm()
+        run('qm', 'unlock', ident)
+        if self.a.cleanup_local:
+            shutil.rmtree(stage)
+        console.note(f'Recovery complete: VM {ident} retained, stopped and unlocked; cloud archive ready to restore')
 
     def download(self):
         destination, m = self.manifest(self.a.backup_id)
@@ -952,7 +1050,7 @@ def parser():
                'Upload selects snapshot-preserving native QCOW2 mode when needed; unsupported layouts fail.\n'
                'Restore selects the latest complete archive, refuses occupied VMIDs, and leaves the VM stopped.\n'
                'Update after active tasks finish: cd /opt/pve-drive && git pull --ff-only && sudo ./install.sh\n'
-               'More help: pve-drive upload --help | pve-drive restore --help | ADMIN.md')
+               'More help: pve-drive upload --help | pve-drive restore --help | pve-drive recover --help | ADMIN.md')
     p.add_argument('--version', action='version', version=__version__)
     p.add_argument('--verbose', action='store_true', help='Show commands and raw diagnostics (default: concise progress). Full logs: /var/log/pve-drive/')
     p.add_argument('--remote', required=True, help='Configured rclone remote:dedicated-folder')
@@ -964,6 +1062,14 @@ def parser():
     p.add_argument('--rclone-config', default='/root/.config/rclone/rclone.conf', help='rclone configuration (default: %(default)s)')
     p.add_argument('--work-dir', default='/var/lib/vz/pve-drive', help='Local staging directory (default: %(default)s)')
     sub = p.add_subparsers(dest='command', required=True)
+    recovery = sub.add_parser('recover', help='Finalize an interrupted upload using its existing staging files',
+        description='Verify existing local files with SHA-256 and cloud files with size/MD5, publish the completion marker, '
+                    'and unlock the original stopped VM. Never deletes the VM or uploads archive data. '
+                    'Requires a manifest in the staging directory, the original source node, and a backup-locked VM. '
+                    'Missing/incomplete cloud files fail; remotes must expose MD5.')
+    recovery.add_argument('vmid', type=vmid)
+    recovery.add_argument('--resume', required=True, metavar='STAGING_DIR', help='Exact existing staging directory printed by the interrupted upload')
+    recovery.add_argument('--cleanup-local', action='store_true', help='Remove staging only after successful recovery (default: retain it)')
     to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM, verify, then delete VM',
         description='Shut down the source VM, select the archive format automatically, upload and verify, then delete it. '
                     'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history.',
