@@ -18,7 +18,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.8.2'
+__version__ = '0.8.3'
 
 
 def duration(seconds):
@@ -855,6 +855,8 @@ class Manager:
         console.note('Attempt cleanup complete')
 
     def archive(self):
+        if getattr(self.a, 'drive_chunk_size', None) is not None and not getattr(self.a, 'stream', False):
+            raise ValueError('--drive-chunk-size requires --stream')
         ident = vmid(self.a.vmid)
         if not self.a.delete_vm and not self.a.keep_vm:
             raise ValueError('Choose --delete-vm or --keep-vm')
@@ -978,7 +980,7 @@ class Manager:
              '--tmpdir', str(tmp), '--remove', '0'],
             ['rclone', '--config', self.a.rclone_config, '--retries', '1', '--low-level-retries', '10',
              'rcat', destination + '/' + filename, '--streaming-upload-cutoff', '1M',
-             '--buffer-size', '8M', '--drive-chunk-size', '32M'],
+             '--buffer-size', '8M', '--drive-chunk-size', getattr(self.a, 'drive_chunk_size', None) or '32M'],
             ['zstd', '--test', '-'], stage, estimated_total=estimate)
         # Successful processes are necessary, but also require every configured
         # data disk to be acknowledged by vzdump before certifying the stream.
@@ -1619,6 +1621,8 @@ def parser():
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
     to.add_argument('--stream', action='store_true', help='Stream VMA directly to cloud without a local archive; requires no snapshots and remote streaming/MD5 support. Progress uses an estimated maximum size/ETA; interrupted streams restart from the beginning')
+    to.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'],
+                    help='Google Drive upload chunk size with --stream (default: 32M). Larger chunks use more RAM; try 128M for large archives')
     to.add_argument('--deep-verify', action='store_true', help='Verify upload by downloading it again (default: require matching cloud sizes and MD5 hashes)')
     to.add_argument('--resume', metavar='STAGING_DIR', help='Retry a failed native local copy in its existing staging directory')
     to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain staging after success (default: remove it); failures retain files')

@@ -50,6 +50,8 @@ Streaming restore writes destination disks before the final SHA-256 result is av
 
 ### Interrupted streams
 
+For Google Drive, `upload VMID --stream --drive-chunk-size 128M` overrides the default 32 MiB upload chunks. Supported values are `8M`, `16M`, `32M`, `64M`, `128M`, and `256M`. Chunk buffers consume RAM; larger chunks may reduce request overhead but do not guarantee higher throughput. The option requires `--stream`, does not affect compression, and cannot change an active transfer. Compare sustained rates while keeping other settings unchanged.
+
 Version 0.8.1 fixes an SSH-terminal startup failure in streaming upload (`failed to tcsetpgrp`, followed by zstd `unexpected end of file`). Update before retrying an affected attempt. This failure occurs before backup data is produced; it cannot be finalized with `recover`.
 
 An interrupted upload has no resumable local archive. Check the VM and Proxmox task state before retrying; keep the source stopped. If a backup lock remains, unlock only after confirming the failed task has ended. Run `upload VMID --stream` again to start a new attempt. Incomplete cloud folders remain hidden from `list`; their exact destination is recorded in `attempt.json`. They are retained for inspection and can be removed manually once the attempt is confirmed incomplete. No automatic remote pruning is performed.

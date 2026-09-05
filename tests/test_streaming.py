@@ -183,6 +183,22 @@ class StreamLifecycleTests(unittest.TestCase):
         self.assertFalse(self.case.deleted)
         self.assertIn(['qm', 'unlock', '100'], self.case.commands)
 
+    def test_drive_chunk_size_default_and_override(self):
+        for selected, expected in [(None, '32M'), ('128M', '128M')]:
+            self.a.drive_chunk_size = selected
+            def inspect(producer, uploader, checker, stage, **kwargs):
+                self.assertEqual(uploader[uploader.index('--drive-chunk-size') + 1], expected)
+                raise RuntimeError('stop after checking launch arguments')
+            with self.subTest(chunk=selected), patch.object(self, 'pipeline', side_effect=inspect), self.assertRaises(RuntimeError):
+                self.execute()
+
+    def test_drive_chunk_size_requires_stream_before_vm_changes(self):
+        self.a.stream = False
+        self.a.drive_chunk_size = '128M'
+        with self.assertRaisesRegex(ValueError, 'requires --stream'):
+            self.execute()
+        self.assertEqual(self.case.commands, [])
+
     def test_unsupported_remote_fails_before_shutdown(self):
         for features in [{'Features': {'PutStream': False}, 'Hashes': ['MD5']},
                          {'Features': {'PutStream': True}, 'Hashes': []}]:

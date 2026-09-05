@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.3
+
+- Add `upload --stream --drive-chunk-size` to tune Google Drive upload chunks. The default remains 32 MiB; 128 MiB can be selected for throughput testing without changing compression settings.
+
 ## 0.8.2
 
 - Show a conservative estimated maximum archive size and ETA during streaming upload, using configured disk capacity plus an overhead allowance.

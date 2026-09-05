@@ -67,6 +67,8 @@ Streaming requires a remote with streaming upload and MD5 support, such as Googl
 
 Streaming upload progress shows an estimated maximum size and ETA based on configured disk capacities plus an overhead allowance. Compression can make the actual archive substantially smaller.
 
+For large Google Drive uploads, test `--stream --drive-chunk-size 128M`. The default is `32M`; larger chunks use more RAM and may improve throughput. The option does not change compression settings.
+
 ### List
 
 List the latest complete archive for each source VM, including archive size and snapshot names:
