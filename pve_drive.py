@@ -13,7 +13,7 @@ import tempfile
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.4.0'
+__version__ = '0.4.1'
 
 def run(*args, capture=False):
     print('+ ' + ' '.join(map(str, args)), file=sys.stderr, flush=True)
@@ -27,6 +27,34 @@ def sha256(path):
         for chunk in iter(lambda: f.read(8 * 1024 * 1024), b''):
             h.update(chunk)
     return h.hexdigest()
+
+
+def file_details(path):
+    s = Path(path).stat()
+    return {'path': str(path), 'size': s.st_size, 'mtime_ns': s.st_mtime_ns,
+            'ctime_ns': s.st_ctime_ns, 'device': s.st_dev, 'inode': s.st_ino}
+
+
+def verified_native_copy(source, destination, report_path):
+    """Never accept a mismatch; retain evidence to distinguish a changing source."""
+    before = file_details(source)
+    source_hash = sha256(source)
+    run('cp', '--reflink=auto', '--sparse=always', '--', source, destination)
+    destination_hash = sha256(destination)
+    after = file_details(source)
+    destination_details = file_details(destination)
+    if destination_hash != source_hash or before != after:
+        current_source_hash = sha256(source)
+        report = {'source_before': before, 'source_after': after,
+                  'destination': destination_details, 'source_sha256_before': source_hash,
+                  'source_sha256_after': current_source_hash,
+                  'destination_sha256': destination_hash}
+        Path(report_path).write_text(json.dumps(report, indent=2) + '\n')
+        reason = ('Source changed during checksum/copy' if before != after or current_source_hash != source_hash
+                  else 'Copied bytes differ from the source')
+        raise ValueError(f'{reason}. No upload or VM deletion performed. '
+                         f'Diagnostic details: {report_path}')
+    return source_hash
 
 
 def vmid(value):
@@ -475,10 +503,7 @@ class Manager:
         for key, path in sources.items():
             info = self.qcow_info(path, snapshots)
             dest = payload / (key + '.qcow2')
-            source_hash = sha256(path)
-            run('cp', '--reflink=auto', '--sparse=always', '--', path, dest)
-            if sha256(dest) != source_hash:
-                raise ValueError('Native local copy checksum mismatch')
+            source_hash = verified_native_copy(path, dest, stage / 'copy-mismatch.json')
             self.qcow_info(dest, snapshots)
             records.append({'filename': dest.name, 'volume': volumes[key], 'device': key,
                             'virtual_size': info['virtual-size'], 'size': dest.stat().st_size,
