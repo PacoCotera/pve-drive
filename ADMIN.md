@@ -1,4 +1,4 @@
-# Admin quick start — version 0.5.0
+# Admin quick start — version 0.6.0
 
 **Experimental:** complete a test upload, restore, and snapshot rollback before relying on VM deletion. Use `--keep-vm` for the first upload.
 
@@ -82,7 +82,7 @@ Run `pve-drive --help`, `pve-drive upload --help`, `pve-drive list --help`, or `
 The default display shows stages and elapsed time. Disk copying, SHA-256 checks,
 and rclone transfers show percentage, bytes, speed, and estimated time remaining
 when totals are available. Stages without measurable byte progress show elapsed
-time only; cloud read-back verification can take as long as a download.
+time only. Optional deep verification reads the entire archive back from the cloud.
 An interactive terminal refreshes the progress line; redirected output prints
 periodic lines without terminal control codes.
 
@@ -99,3 +99,27 @@ pve-drive --verbose --remote gdrive:pve-archive --source pve-site-a upload 100 -
 
 Display updates take effect on the next run after installation. Let an active
 upload or restore finish before updating.
+
+## Upload verification modes
+
+The default upload/archive verification compares every local payload file's size
+and MD5 against the remote's stored metadata. Google Drive supports MD5 for these
+binary files. This reads the local files for hashing but does not download the
+archive again. Local SHA-256 copy checks, manifest checks, restore SHA-256 checks,
+and the completion marker remain required.
+
+Missing or malformed MD5 hashes, mismatches, missing/extra files, and duplicate
+remote paths stop the operation before completion-marker publication or VM deletion.
+There is no fallback to size-only checks. For remotes without MD5 support, select
+full read-back verification when starting the upload:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --deep-verify --keep-vm
+```
+
+`archive` also accepts `--deep-verify`. The standalone `verify BACKUP_ID` command
+continues to download the backup and validate SHA-256; it audits existing archives.
+Metadata verification detects transfer corruption but is not an independent read
+of the stored bytes. Use deep verification when that additional check is wanted.
+This change removes the default verification download; it does not accelerate the
+upload itself. An already running operation keeps its original verification mode.

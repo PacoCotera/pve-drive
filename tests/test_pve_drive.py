@@ -16,7 +16,7 @@ class LifecycleTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.args = p.parser().parse_args([
             '--remote', 'gdrive:pve-archive', '--source', 'pve-site-b', '--work-dir', self.tmp.name,
-            'archive', '100', '--delete-vm'])
+            'archive', '100', '--delete-vm', '--deep-verify'])
         self.m = p.Manager(self.args)
         self.cfg = {'digest': 'abc', 'name': 'test', 'scsi0': 'local-lvm:vm-100-disk-0'}
         self.commands = []

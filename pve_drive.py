@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.5.0'
+__version__ = '0.6.0'
 
 
 def duration(seconds):
@@ -194,12 +194,12 @@ def run(*args, capture=False):
         return out_path.read_text(errors='replace') if capture else None
 
 
-def sha256(path):
-    h = hashlib.sha256()
+def file_hash(path, algorithm='sha256'):
+    h = hashlib.md5(usedforsecurity=False) if algorithm == 'md5' else hashlib.sha256()
     total = Path(path).stat().st_size
     show = total >= 64 * 1024 * 1024
     if show:
-        console.stage(f'Verifying SHA-256: {Path(path).name}')
+        console.stage(f'Computing {algorithm.upper()}: {Path(path).name}')
     done = 0
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(8 * 1024 * 1024), b''):
@@ -211,6 +211,10 @@ def sha256(path):
         console.update(done, total, force=True)
         console.clear()
     return h.hexdigest()
+
+
+def sha256(path):
+    return file_hash(path)
 
 
 def file_details(path):
@@ -443,6 +447,46 @@ class Manager:
     def api(self, path):
         return json.loads(run('pvesh', 'get', path, '--output-format', 'json', capture=True))
 
+    def verify_upload(self, payload, destination):
+        if getattr(self.a, 'deep_verify', False):
+            self.rc('check', payload, destination, '--download')
+            return
+        # Require MD5 explicitly: plain rclone check can fall back to size only
+        # when a remote does not expose a compatible checksum.
+        console.stage('Computing local MD5 checksums')
+        local = {}
+        for path in sorted(Path(payload).rglob('*')):
+            if path.is_symlink():
+                raise ValueError('Refusing symlink in upload payload')
+            if not path.is_file():
+                continue
+            before = file_details(path)
+            digest = file_hash(path, 'md5')
+            if file_details(path) != before:
+                raise ValueError('Upload payload changed while hashing')
+            local[path.relative_to(payload).as_posix()] = (before['size'], digest)
+        if not local:
+            raise ValueError('Upload payload is empty')
+        console.stage('Comparing cloud file sizes and MD5 checksums')
+        rows = json.loads(self.rc('lsjson', destination, '--recursive', '--files-only', '--hash', capture=True))
+        remote = {}
+        for row in rows:
+            name = row['Path']
+            if name in remote:
+                raise ValueError(f'Duplicate cloud path: {name}')
+            hashes = {k.lower(): v for k, v in row.get('Hashes', {}).items()}
+            digest = hashes.get('md5', '')
+            if not isinstance(digest, str) or not re.fullmatch(r'[a-fA-F0-9]{32}', digest):
+                raise ValueError(f'Cloud MD5 unavailable for {name}; verification failed. '
+                                 'Use --deep-verify for remotes without MD5 support.')
+            remote[name] = (row.get('Size'), digest.lower())
+        if set(remote) != set(local):
+            raise ValueError('Cloud file listing differs from upload payload')
+        for name, expected in local.items():
+            if remote[name] != expected:
+                raise ValueError(f'Cloud size/MD5 mismatch: {name}')
+        console.note(f'Cloud size and MD5 verified for {len(local)} files; no archive download')
+
     def vm_path(self, ident):
         # /etc/pve/local follows Proxmox's canonical node name, not the FQDN.
         node = Path('/etc/pve/local').resolve().name
@@ -539,7 +583,7 @@ class Manager:
         (payload / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         self.rc('copy', payload, destination, '--immutable')
         # Full read-back; no reliance on size-only comparisons or backend hashes.
-        self.rc('check', payload, destination, '--download')
+        self.verify_upload(payload, destination)
         marker = stage / 'COMPLETE'
         marker.write_text(sha256(payload / 'manifest.json') + '\n')
         self.rc('copyto', marker, f'{destination}/COMPLETE', '--immutable')
@@ -770,7 +814,7 @@ class Manager:
         (payload / 'manifest.json').write_bytes((json.dumps(m, indent=2) + '\n').encode('utf-8'))
         destination = self.base + '/' + bid
         self.rc('copy', payload, destination, '--immutable')
-        self.rc('check', payload, destination, '--download')
+        self.verify_upload(payload, destination)
         marker = stage / 'COMPLETE'
         marker.write_bytes((sha256(payload / 'manifest.json') + '\n').encode('ascii'))
         self.rc('copyto', marker, destination + '/COMPLETE', '--immutable')
@@ -928,6 +972,7 @@ def parser():
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
+    to.add_argument('--deep-verify', action='store_true', help='Verify upload by downloading it again (default: require matching cloud sizes and MD5 hashes)')
     to.add_argument('--resume', metavar='STAGING_DIR', help='Retry a failed native local copy in its existing staging directory')
     to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain staging after success (default: remove it); failures retain files')
     to.add_argument('--shutdown-timeout', type=int, default=300, help='Graceful shutdown timeout in seconds (default: %(default)s); no forced stop')
@@ -939,6 +984,7 @@ def parser():
     fr.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True)
     a = sub.add_parser('archive', help='Advanced: select archive format and deletion policy explicitly')
     a.add_argument('vmid', type=vmid)
+    a.add_argument('--deep-verify', action='store_true', help='Download upload again to verify it (default: cloud size and MD5 comparison)')
     g = a.add_mutually_exclusive_group(required=True)
     g.add_argument('--delete-vm', action='store_true')
     g.add_argument('--keep-vm', action='store_true')
