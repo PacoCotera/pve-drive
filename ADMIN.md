@@ -1,12 +1,12 @@
-# Admin quick start — version 0.4.2
+# Admin quick start — version 0.4.3
 
 ## Install and update
 
 Clone once into a separate source directory (authenticate to the private repository when prompted):
 
 ```bash
-git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive
-cd /opt/pve-drive
+git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive &&
+cd /opt/pve-drive &&
 sudo ./install.sh
 ```
 
@@ -70,3 +70,7 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 ```
 
 Use the exact staging directory printed by your failed operation. Leave the VM stopped with its backup lock; do not unlock before this command. Resume verifies the full VM/snapshot configuration, replaces the failed local copies in that same directory, then performs all normal checks. It does not create a second staging directory. It is not a general interrupted-upload resume and refuses stages with a manifest or completion marker. `--keep-vm` retains the original VM for this recovery test. Sparse output is based only on buffers actually read as zero; filesystem hole reporting and reflinks are not used. Disk-full or integrity errors still stop the operation and retain recovery files.
+
+## Built-in help
+
+Run `pve-drive --help`, `pve-drive upload --help`, `pve-drive list --help`, or `pve-drive restore --help` for examples and defaults. Global options go before the command. For this private repository, use a GitHub personal access token at the Git password prompt, not your account password. Wait for active uploads/restores to finish before running the installer.
