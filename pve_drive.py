@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.8.0'
+__version__ = '0.8.1'
 
 
 def duration(seconds):
@@ -270,7 +270,10 @@ def stream_pipeline(producer_args, upload_args, check_args, stage, *,
                 downstream.stdin.close()  # Only the decompressor owns the write end.
             checker = (launch('zstd-check', check_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
                        if check_args else None)
-            producer = launch(producer_name, producer_args, stdout=subprocess.PIPE)
+            # A setsid child must not inherit the SSH tty: Proxmox detects
+            # isatty(stdin) and tries tcsetpgrp on a terminal outside its session.
+            producer = launch(producer_name, producer_args, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE)
 
             def relay():
                 try:
@@ -310,8 +313,22 @@ def stream_pipeline(producer_args, upload_args, check_args, stage, *,
             drain()
             console.update(state['size'], total, force=True)
             return dict(state, sha256=digest.hexdigest(), md5=md5.hexdigest())
-        except BaseException:
+        except BaseException as exc:
             stop()
+            if isinstance(exc, Exception):
+                details = []
+                # Include producer diagnostics even when a downstream checker
+                # notices EOF first. Never report just the resulting broken pipe.
+                for name in [producer_name] + [name for name, _ in processes if name != producer_name]:
+                    path = stage / (name + '.log')
+                    if path.exists():
+                        with path.open('rb') as log:
+                            log.seek(max(0, path.stat().st_size - 1500))
+                            detail = log.read().decode(errors='replace').strip()
+                        if detail:
+                            details.append(f'{name}: {detail}')
+                if details:
+                    raise RuntimeError(str(exc) + '\n' + '\n'.join(details)) from exc
             raise
         finally:
             if worker is not None:

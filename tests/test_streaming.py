@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -45,6 +47,31 @@ class PipelineTests(unittest.TestCase):
         consumer = self.command('import sys; sys.stdin.buffer.read()')
         with self.assertRaises(RuntimeError):
             p.stream_pipeline(producer, consumer, consumer, self.stage)
+
+    def test_producer_diagnostic_is_reported_with_downstream_failure(self):
+        producer = self.command('import sys; print("backup worker startup failed", file=sys.stderr); sys.exit(25)')
+        consumer = self.command('import sys; sys.stdin.buffer.read(); sys.exit(1)')
+        with self.assertRaisesRegex(RuntimeError, 'backup worker startup failed'):
+            p.stream_pipeline(producer, consumer, consumer, self.stage)
+
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX terminal semantics')
+    def test_pipeline_launched_from_terminal_does_not_pass_terminal_to_producer(self):
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        # Emulate the Proxmox branch: an inherited tty in a new session causes
+        # tcsetpgrp to fail. Parent stdin is a tty; producer stdin must not be.
+        producer = self.command('import os,sys; '
+            'os.tcsetpgrp(0, os.getpgrp()) if os.isatty(0) else None; '
+            'sys.stdout.buffer.write(b"archive")')
+        consumer = self.command('import sys; assert sys.stdin.buffer.read()==b"archive"')
+        script = ('import sys; sys.path.insert(0, ' + repr(str(Path(p.__file__).parent)) + '); '
+                  'import pve_drive as p; '
+                  f'r=p.stream_pipeline({producer!r}, {consumer!r}, {consumer!r}, {str(self.stage)!r}); '
+                  'assert r["size"]==7')
+        result = subprocess.run(self.command(script), stdin=slave, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
 
     def test_restore_pipeline_hashes_input_and_delivers_transformed_output(self):
         producer = self.command('import sys; sys.stdout.buffer.write(b"compressed")')

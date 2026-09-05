@@ -50,6 +50,8 @@ Streaming restore writes destination disks before the final SHA-256 result is av
 
 ### Interrupted streams
 
+Version 0.8.1 fixes an SSH-terminal startup failure in streaming upload (`failed to tcsetpgrp`, followed by zstd `unexpected end of file`). Update before retrying an affected attempt. This failure occurs before backup data is produced; it cannot be finalized with `recover`.
+
 An interrupted upload has no resumable local archive. Check the VM and Proxmox task state before retrying; keep the source stopped. If a backup lock remains, unlock only after confirming the failed task has ended. Run `upload VMID --stream` again to start a new attempt. Incomplete cloud folders remain hidden from `list`; their exact destination is recorded in `attempt.json`. They are retained for inspection and can be removed manually once the attempt is confirmed incomplete. No automatic remote pruning is performed.
 
 If all stream processes completed but cloud verification or finalization failed, a `stream-complete.json` receipt enables recovery without retransmitting disk data:
