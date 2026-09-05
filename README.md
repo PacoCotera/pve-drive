@@ -1,12 +1,12 @@
 # pve-drive
 
-Move Proxmox QEMU VMs to Google Shared Drive with rclone, then restore them by VMID—even on another server or under another VMID.
+Archive Proxmox QEMU virtual machines to a Google Shared Drive using rclone. Restore archives by source VM ID, with support for alternative destination nodes, VM IDs, and storage.
 
-**Experimental:** test an upload with `--keep-vm`, a restore, and snapshot rollback before relying on VM deletion.
+**Status: experimental.** Validate upload, restore, and snapshot rollback with `--keep-vm` before enabling source VM deletion.
 
-## Install
+## Installation
 
-Run as root on the Proxmox node. Requires Git, Python 3, rclone, zstd, and the standard Proxmox tools.
+Run installation and VM operations as root on the Proxmox node. Dependencies: Git, Python 3, rclone, zstd, and the standard Proxmox command-line tools.
 
 ```bash
 apt-get install git python3 rclone zstd
@@ -14,76 +14,80 @@ git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive &&
 cd /opt/pve-drive && ./install.sh
 ```
 
-Update after active operations finish:
+Update the installed executable after all active operations have completed:
 
 ```bash
 cd /opt/pve-drive && git pull --ff-only && ./install.sh
 ```
 
-## Configure
+## Configuration
 
-Run `rclone config`, create a Google Drive remote named `gdrive`, and select your Shared Drive. See [rclone’s setup guide](https://rclone.org/drive/).
+Use `rclone config` to configure a Google Drive remote named `gdrive` and select the destination Shared Drive. Refer to the [rclone Google Drive documentation](https://rclone.org/drive/) for authentication and configuration requirements.
 
 ```bash
 rclone lsd gdrive:
 rclone mkdir gdrive:pve-archive
 ```
 
-## Command structure
+## Usage
 
 ```text
-pve-drive --remote <REMOTE:FOLDER> --source <SOURCE_LABEL> <COMMAND> [VMID] [OPTIONS]
+pve-drive --remote REMOTE:FOLDER --source SOURCE_LABEL COMMAND [VMID] [OPTIONS]
 ```
 
-Replace `<...>` with your values; brackets indicate optional arguments and are not typed. `upload` and `restore` require a VM ID; `list` does not. Global options (`--remote`, `--source`, `--work-dir`) go before the command; command options go after it.
+Uppercase terms represent argument values. Square brackets denote optional syntax; `VMID` is required for `upload` and `restore` and omitted for `list`. Global options precede `COMMAND`; command-specific options follow its positional arguments.
 
-## Upload, list, restore
+### Upload
 
-For example, to upload a test archive:
+Create and verify an archive while retaining the source VM:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
 ```
 
-This command shuts down VM **100**, archives it in **pve-archive** on the **gdrive** remote, labels the archive’s source **pve-site-a**, and keeps the original VM stopped on the server.
+The example archives VM `100` to `gdrive:pve-archive` under source identifier `pve-site-a`. The source VM is shut down before archiving and retained in a stopped state after verification.
 
-| Part of the sample | Meaning |
+| Argument | Description |
 | --- | --- |
-| `--remote gdrive:pve-archive` | `gdrive` is the remote configured in rclone; `pve-archive` is the folder inside it. |
-| `--source pve-site-a` | A unique label you choose for this source Proxmox server. Reuse it when listing or restoring its archives, even on another server. It does not connect to that server. |
-| `upload` | Archive the VM and verify the uploaded files. Run this on the VM’s owning node. |
-| `100` | The existing Proxmox VM ID to archive. Replace it with yours. |
-| `--keep-vm` | Retain the original VM after verification, shut down and stopped. |
+| `--remote gdrive:pve-archive` | Destination folder `pve-archive` on the configured rclone remote `gdrive`. |
+| `--source pve-site-a` | Persistent archive identifier for the source node. Use the same identifier for listing and restoration, including restoration on another node. This value identifies archives; it is not a connection address. |
+| `upload` | Archive and verify the VM. Execute on the node that owns the source VM. |
+| `100` | Proxmox ID of the source VM. |
+| `--keep-vm` | Retain the source VM and its disks after verification. The VM remains stopped. |
 
-**Omit `--keep-vm` to delete the original VM and its disks after successful verification.**
+**Without `--keep-vm`, a successful upload deletes the source VM and its disks after verification.**
 
-List archived VMs, including sizes and snapshots:
+### List
+
+List the latest complete archive for each source VM, including archive size and snapshot names:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a list
 ```
 
-Restore the latest archive to its original VMID and storage:
+### Restore
+
+Restore the latest complete archive to its original VM ID and storage:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
 ```
 
-Or restore on a destination node under another VMID and storage. `--target-vmid 200` selects an unused destination VM ID, `--storage destination-dir` selects an existing Proxmox storage ID, and `--unique` generates new MAC addresses:
+To specify a different destination, use `--target-vmid` for an unused VM ID and `--storage` for an existing Proxmox storage ID. The `--unique` option generates new MAC addresses:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \
   restore 100 --target-vmid 200 --storage destination-dir --unique
 ```
 
-Restore refuses occupied VMIDs and leaves the VM stopped. `--unique` changes MAC addresses, not guest static IPs. The cloud archive is retained.
+Restoration rejects occupied VM IDs and leaves the restored VM stopped. Guest static IP addresses are unaffected by `--unique`. The cloud archive is retained.
 
-## What to expect
+## Operational notes
 
 - Supported internal QCOW2 disk snapshots are preserved; unsupported layouts are rejected.
-- Upload verification compares cloud sizes and MD5 hashes. Add `--deep-verify` for a full read-back. Restore checks SHA-256.
-- Staging defaults to `/var/lib/vz/pve-drive`. Use `--work-dir PATH` before the command if that filesystem is short on space. Native restore needs room for both the download and restored disks.
+- Upload verification compares local file sizes and MD5 hashes against remote metadata. `--deep-verify` performs full read-back verification. Restoration validates SHA-256 checksums.
+- The default staging directory is `/var/lib/vz/pve-drive`; override it with the global option `--work-dir PATH`. Native restoration requires capacity for both the downloaded archive and the restored disks.
 
-See [ADMIN.md](ADMIN.md) for recovery, storage requirements, supported layouts, and diagnostics. For command help, run `pve-drive --help` or `pve-drive restore --help`.
+Refer to [ADMIN.md](ADMIN.md) for recovery procedures, storage requirements, supported layouts, and diagnostics. Use `pve-drive --help` or `pve-drive COMMAND --help` for the command reference.
 
 [MIT License](LICENSE) · © 2026 Paco Cotera
