@@ -65,6 +65,16 @@ Use the exact printed directory, with the matching `--work-dir` if overridden. R
 
 See the upstream [vzdump documentation](https://pve.proxmox.com/pve-docs/vzdump.1.html) and [rclone rcat documentation](https://rclone.org/commands/rclone_rcat/) for streaming behavior. rcat cannot replay a failed stream; backend chunk retries remain available where supported.
 
+## Cleanup policy
+
+Successful upload, restore, and recovery remove staging by default. `--keep-local` explicitly retains it. Failed operations retain local recovery data; cleanup is not automatic because it can make an otherwise recoverable upload unrecoverable. Completed cloud archives remain available after restore.
+
+Use `cleanup` to list local staging directories and `cleanup --stage PATH` to preview one abandoned attempt. Add `--apply` to discard that attempt's staging and any recorded incomplete cloud upload. The command requires a recognized directory directly under `--work-dir`, rejects symlinks and nested mounts, validates recorded source/VM identities, and checks for a cloud completion marker before deletion. Any completion marker protects the cloud archive. Remote listing or deletion errors preserve local recovery files. If no cloud destination was recorded, only the explicitly selected local directory is removed; the command does not guess remote paths or sweep unrelated backups.
+
+Cleanup uses the same per-node operation lock as upload and restore. Do not run separate Proxmox/rclone tasks against the selected attempt during cleanup. A cloud completion marker is rechecked immediately before deletion, but Google Drive does not provide a transaction spanning this check and deletion. Source labels must remain unique to their owning nodes.
+
+VMs, allocated VM disks, VM locks, and `/var/log/pve-drive` logs are never deleted by cleanup. Restore allocation records are copied into the cleanup log before their staging directory is removed. Inspect a failed target and remove any unwanted partial VM through Proxmox. Diagnostic logs intentionally remain for troubleshooting and require normal site log-retention management. Google Drive may retain deleted objects in its trash according to the remote configuration; cleanup does not empty shared-drive trash.
+
 ## Supported archives and limitations
 
 | VM layout | Archive format |

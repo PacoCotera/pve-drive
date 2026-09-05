@@ -101,6 +101,18 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 
 Streaming restoration checks SHA-256 as data is restored. A failed operation may leave unverified destination disks; inspect the target before retrying. Destination storage still needs sufficient capacity for the restored disks.
 
+## Cleanup
+
+Successful operations remove local staging unless `--keep-local` is used. Failed operations retain recovery files. To inspect and discard an abandoned attempt:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup
+pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup --stage /var/lib/vz/pve-drive/stream-100-EXAMPLE
+pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup --stage /var/lib/vz/pve-drive/stream-100-EXAMPLE --apply
+```
+
+`cleanup` lists staging directories; `--stage` previews one attempt; `--apply` discards its local recovery files and recorded incomplete cloud upload. Completed cloud archives, VM disks, locks, and diagnostic logs are retained. Use the matching `--work-dir` for staging on another filesystem. Run cleanup after active tasks finish.
+
 ## Operational notes
 
 - Successful upload, restore, and recovery remove local staging files by default. Use `--keep-local` to retain them. Files needed after an interrupted operation are preserved.
@@ -112,4 +124,4 @@ Streaming restoration checks SHA-256 as data is restored. A failed operation may
 
 Refer to [ADMIN.md](ADMIN.md) for recovery procedures, storage requirements, supported layouts, and diagnostics. Use `pve-drive --help` or `pve-drive COMMAND --help` for the command reference.
 
-[MIT License](LICENSE) · © 2026 Paco Cotera
+[Changelog](CHANGELOG.md) · [MIT License](LICENSE) · © 2026 Paco Cotera

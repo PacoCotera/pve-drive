@@ -762,6 +762,98 @@ class Manager:
         console.note(f'Recovery files: {path}')
         return path
 
+    def cleanup(self):
+        """Preview or discard one explicit attempt, never a completed cloud archive."""
+        if not self.a.source:
+            raise ValueError('Cleanup requires --source')
+        if not self.a.stage:
+            if self.a.apply:
+                raise ValueError('--apply requires one explicit --stage directory')
+            console.note(f'Local staging directories under {self.work}:')
+            if self.work.is_dir():
+                for path in sorted(self.work.iterdir()):
+                    if path.is_dir() and not path.is_symlink():
+                        print(path)
+            console.note('Preview an attempt with cleanup --stage PATH; add --apply to discard it.')
+            return
+        requested = Path(self.a.stage)
+        stage = requested.resolve()
+        pattern = r'(?:(?:native|archive|stream)-[1-9][0-9]{2,8}|native-download|restore|stream-restore-[1-9][0-9]{2,8})-[A-Za-z0-9_-]+'
+        if (requested.is_symlink() or stage.parent != self.work or not stage.is_dir()
+                or not re.fullmatch(pattern, stage.name) or stage.is_mount()):
+            raise ValueError('Cleanup requires one recognized staging directory directly under --work-dir')
+        # Refuse nested symlinks/mounts rather than follow them during inspection/deletion.
+        size = 0
+        for root, dirs, files in os.walk(stage, followlinks=False):
+            for name in dirs + files:
+                path = Path(root) / name
+                if path.is_symlink() or path.is_mount():
+                    raise ValueError('Cleanup refuses symlinks or nested mounts')
+                if path.is_file():
+                    size += path.stat().st_size
+        destination = None
+        upload = re.fullmatch(r'(native|archive|stream)-([1-9][0-9]{2,8})-[A-Za-z0-9_-]+', stage.name)
+        if upload:
+            attempt_path = stage / 'attempt.json'
+            manifest_path = stage / 'payload' / 'manifest.json'
+            bid = None
+            if attempt_path.exists():
+                attempt = json.loads(attempt_path.read_text())
+                bid = backup_id(attempt.get('backup_id', ''))
+                if attempt.get('destination') != self.base + '/' + bid:
+                    raise ValueError('Attempt remote/source differs from selected --remote/--source')
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text())
+                manifest_bid = backup_id(manifest.get('backup_id', ''))
+                self.validate_manifest(manifest, manifest_bid)
+                if manifest.get('source_node') != Path('/etc/pve/local').resolve().name:
+                    raise ValueError('Cleanup must run on the original upload node')
+                if bid is not None and bid != manifest_bid:
+                    raise ValueError('Conflicting attempt and manifest backup IDs')
+                bid = manifest_bid
+            if bid is not None:
+                if bid.split('/')[0] != upload[2]:
+                    raise ValueError('Attempt VMID differs from staging directory')
+                destination = self.base + '/' + bid
+        def cloud_state():
+            if destination is None:
+                return 'unrecorded'
+            # A successful listing distinguishes absence from a permission/network error.
+            rows = json.loads(self.rc('lsjson', self.base, '--recursive', capture=True))
+            prefix = destination[len(self.base) + 1:] + '/'
+            names = [row['Path'][len(prefix):] for row in rows if row['Path'].startswith(prefix)]
+            if 'COMPLETE' in names:
+                return 'complete'
+            return 'incomplete' if names else 'absent'
+        remote_state = cloud_state()
+        console.note(f'Local files to remove: {stage} ({human_bytes(size)} logical size)')
+        if remote_state == 'incomplete':
+            console.note(f'Incomplete cloud attempt to remove: {destination}')
+            console.note('This discards recovery data. Use recover instead if the upload should be finalized.')
+        elif remote_state == 'complete':
+            console.note(f'Completed cloud archive retained: {destination}')
+        else:
+            console.note('No recorded cloud files to remove; remote archives are retained.')
+        state_path = stage / 'restore-state.json'
+        if state_path.exists():
+            console.record('Retained restore recovery record: ' + state_path.read_text() + '\n')
+        console.note('VMs, VM disks, locks, and diagnostic logs are retained.')
+        if not self.a.apply:
+            console.note('Preview only. Add --apply to discard the listed attempt files.')
+            return
+        # Recheck remote completion immediately before deletion. Any listing error
+        # leaves local recovery data in place; local cleanup follows cloud cleanup.
+        if remote_state == 'incomplete':
+            remote_state = cloud_state()
+            if remote_state == 'incomplete':
+                self.rc('purge', destination)
+                if cloud_state() != 'absent':
+                    raise ValueError('Cloud cleanup could not be confirmed; local files retained')
+            elif remote_state == 'complete':
+                console.note('Cloud archive completed since preview; retaining it.')
+        shutil.rmtree(stage)
+        console.note('Attempt cleanup complete')
+
     def archive(self):
         ident = vmid(self.a.vmid)
         if not self.a.delete_vm and not self.a.keep_vm:
@@ -1496,6 +1588,13 @@ def parser():
     p.add_argument('--rclone-config', default='/root/.config/rclone/rclone.conf', help='rclone configuration (default: %(default)s)')
     p.add_argument('--work-dir', default='/var/lib/vz/pve-drive', help='Local staging directory (default: %(default)s)')
     sub = p.add_subparsers(dest='command', required=True)
+    cleanup = sub.add_parser('cleanup', help='List staging or preview cleanup of one attempt',
+        description='List local staging directories, or preview removal of one exact --stage directory '
+                    'and its recorded incomplete cloud upload. --apply discards that recovery data. '
+                    'Completed cloud archives, VMs, VM disks, locks and diagnostic logs are retained. '
+                    'Run after active tasks finish; use recover to finalize a recoverable upload instead.')
+    cleanup.add_argument('--stage', metavar='PATH', help='Exact attempt directory directly under --work-dir')
+    cleanup.add_argument('--apply', action='store_true', help='Discard the selected attempt files; default is preview only')
     recovery = sub.add_parser('recover', help='Finalize an interrupted upload using its existing staging files',
         description='Verify existing local files with SHA-256 and cloud files with size/MD5, publish the completion marker, '
                     'and unlock the original stopped VM. Never deletes the VM or uploads archive data. '
