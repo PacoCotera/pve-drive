@@ -10,10 +10,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.4.1'
+__version__ = '0.4.2'
 
 def run(*args, capture=False):
     print('+ ' + ' '.join(map(str, args)), file=sys.stderr, flush=True)
@@ -35,11 +36,41 @@ def file_details(path):
             'ctime_ns': s.st_ctime_ns, 'device': s.st_dev, 'inode': s.st_ino}
 
 
+def stream_copy(source, destination):
+    """Read every byte, using holes only for buffers actually read as zero."""
+    source, destination = Path(source), Path(destination)
+    if destination.is_symlink() or (destination.exists() and os.path.samefile(source, destination)):
+        raise ValueError('Refusing to overwrite a symlink or the source disk')
+    total = source.stat().st_size
+    block_size = 8 * 1024 * 1024
+    zero_block = bytes(block_size)
+    copied = 0
+    last_report = time.monotonic()
+    print(f'Sequential copy: {source} -> {destination} ({total} bytes)', file=sys.stderr, flush=True)
+    with source.open('rb') as src, destination.open('wb') as dst:
+        while True:
+            data = src.read(block_size)
+            if not data:
+                break
+            if data == zero_block[:len(data)]:
+                dst.seek(len(data), os.SEEK_CUR)
+            else:
+                dst.write(data)
+            copied += len(data)
+            if time.monotonic() - last_report >= 15:
+                print(f'Copied {copied}/{total} bytes ({100 * copied / max(total, 1):.1f}%)', file=sys.stderr, flush=True)
+                last_report = time.monotonic()
+        dst.truncate(copied)
+        dst.flush()
+        os.fsync(dst.fileno())
+    print(f'Copy finished: {copied} bytes; verifying SHA-256.', file=sys.stderr, flush=True)
+
+
 def verified_native_copy(source, destination, report_path):
     """Never accept a mismatch; retain evidence to distinguish a changing source."""
     before = file_details(source)
     source_hash = sha256(source)
-    run('cp', '--reflink=auto', '--sparse=always', '--', source, destination)
+    stream_copy(source, destination)
     destination_hash = sha256(destination)
     after = file_details(source)
     destination_details = file_details(destination)
@@ -250,6 +281,10 @@ class Manager:
         if not self.a.delete_vm and not self.a.keep_vm:
             raise ValueError('Choose --delete-vm or --keep-vm')
         cfg = self.config(ident)
+        if getattr(self.a, 'resume', None):
+            if cfg.get('lock') != 'backup':
+                raise ValueError('Resume requires the stopped VM to retain its backup lock')
+            cfg.pop('lock')
         external_media = safe_config(cfg)
         report_media(external_media)
         if any(x.get('sid') == f'vm:{ident}' for x in self.api('/cluster/ha/resources')):
@@ -260,7 +295,7 @@ class Manager:
             raise ValueError('Resolve pending VM configuration changes before archiving')
         snapshots = self.api(self.vm_path(ident) + '/snapshot')
         snapshot_names = [s['name'] for s in snapshots if s.get('name') != 'current']
-        if self.a.format == 'native-qcow2' or (self.a.format == 'auto' and snapshot_names):
+        if self.a.format == 'native-qcow2' or (self.a.format == 'auto' and snapshot_names) or getattr(self.a, 'resume', None):
             return self.archive_native(ident, cfg, snapshot_names)
         if snapshot_names:
             if self.a.delete_vm and not self.a.allow_snapshot_loss:
@@ -465,7 +500,25 @@ class Manager:
         return item
 
     def archive_native(self, ident, cfg, snapshots):
-        raw = self.config_file(ident).read_text()
+        resume = getattr(self.a, 'resume', None)
+        if resume:
+            requested = Path(resume)
+            stage = requested.resolve()
+            if requested.is_symlink() or stage.parent != self.work or not stage.name.startswith(f'native-{ident}-'):
+                raise ValueError('Resume path must be this VM native staging directory directly under --work-dir')
+            payload = stage / 'payload'
+            if not payload.is_dir() or payload.is_symlink() or (payload / 'vm.conf').is_symlink():
+                raise ValueError('Invalid native staging directory')
+            if (payload / 'manifest.json').exists() or (stage / 'COMPLETE').exists():
+                raise ValueError('Resume is only supported before manifest creation/upload')
+            raw = (payload / 'vm.conf').read_text()
+            self.stopped(ident)
+            locked_raw = self.config_file(ident).read_text()
+            if re.sub(r'^lock: backup\n', '', locked_raw, flags=re.M) != raw:
+                raise ValueError('VM or snapshot configuration differs from the failed operation')
+            print(f'Resuming failed local copy in {stage}; retaining the VM lock.', file=sys.stderr)
+        else:
+            raw = self.config_file(ident).read_text()
         sections = parse_native_config(raw)
         if set(sections) - {'current'} != set(snapshots):
             raise ValueError('Snapshot configuration changed during preflight')
@@ -481,24 +534,29 @@ class Manager:
             sources[key] = path
         self.rc('mkdir', self.base)
         self.rc('lsjson', self.base, '--max-depth', '1', capture=True)
-        stage = self.stage(f'native-{ident}-')
-        total = sum(p.stat().st_size for p in sources.values())
-        if shutil.disk_usage(stage).free < total + 1024 ** 3:
-            raise ValueError(f'Native staging needs at least {total + 1024 ** 3} free bytes')
-        run('qm', 'shutdown', ident, '--timeout', self.a.shutdown_timeout)
-        self.unchanged(ident, cfg.copy())
-        if self.config_file(ident).read_text() != raw:
-            raise ValueError('Full VM configuration changed before lock')
-        latest = self.config(ident)
-        run('qm', 'set', ident, '--lock', 'backup', '--digest', latest['digest'])
-        locked_raw = self.config_file(ident).read_text()
-        if re.sub(r'^lock: backup\n', '', locked_raw, flags=re.M) != raw:
-            raise ValueError('Unexpected configuration change while acquiring lock')
+        if not resume:
+            stage = self.stage(f'native-{ident}-')
+            total = sum(p.stat().st_size for p in sources.values())
+            if shutil.disk_usage(stage).free < total + 1024 ** 3:
+                raise ValueError(f'Native staging needs at least {total + 1024 ** 3} free bytes')
+            run('qm', 'shutdown', ident, '--timeout', self.a.shutdown_timeout)
+            self.unchanged(ident, cfg.copy())
+            if self.config_file(ident).read_text() != raw:
+                raise ValueError('Full VM configuration changed before lock')
+            latest = self.config(ident)
+            run('qm', 'set', ident, '--lock', 'backup', '--digest', latest['digest'])
+            locked_raw = self.config_file(ident).read_text()
+            if re.sub(r'^lock: backup\n', '', locked_raw, flags=re.M) != raw:
+                raise ValueError('Unexpected configuration change while acquiring lock')
         locked = dict(cfg, lock='backup')
         self.unchanged(ident, locked.copy())
         payload = stage / 'payload'
-        payload.mkdir()
-        (payload / 'vm.conf').write_bytes(raw.encode('utf-8'))
+        if not resume:
+            payload.mkdir()
+            (payload / 'vm.conf').write_bytes(raw.encode('utf-8'))
+        allowed = {'vm.conf'} | {key + '.qcow2' for key in sources}
+        if any(p.name not in allowed or p.is_symlink() or not p.is_file() for p in payload.iterdir()):
+            raise ValueError('Unexpected files in native payload')
         records = []
         for key, path in sources.items():
             info = self.qcow_info(path, snapshots)
@@ -617,7 +675,7 @@ class Manager:
             dest = Path(run('pvesm', 'path', volume, capture=True).strip()).resolve()
             if not dest.is_file():
                 raise ValueError('Allocated destination is not a regular file')
-            run('cp', '--reflink=auto', '--sparse=always', '--', stage / d['filename'], dest)
+            stream_copy(stage / d['filename'], dest)
             if sha256(dest) != d['sha256']:
                 raise ValueError('Installed native disk checksum mismatch')
             self.qcow_info(dest, m['snapshots'])
@@ -656,6 +714,7 @@ def parser():
     to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM and its supported snapshot history, verify, then delete VM')
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
+    to.add_argument('--resume', metavar='STAGING_DIR', help='Retry a failed native local copy in its existing staging directory')
     to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True)
     to.add_argument('--shutdown-timeout', type=int, default=300)
     fr = sub.add_parser('move-from-cloud', help='Restore latest complete archive to its original VMID')
