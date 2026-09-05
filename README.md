@@ -1,6 +1,45 @@
 # pve-drive
 
-Archive Proxmox QEMU virtual machines to a Google Shared Drive using rclone. Restore archives by source VM ID, with support for alternative destination nodes, VM IDs, and storage.
+**Large Proxmox VM archives. Parallel Google Drive transfers. Simple administration.**
+
+pve-drive takes care of shutting down, archiving, verifying, and restoring Proxmox QEMU virtual machines using Google Drive and rclone. It helps you move large VMs off a host, retain verified cloud archives, and restore them on the same or another Proxmox node—without managing individual archive parts yourself.
+
+## Why pve-drive?
+
+- **Use more of your available bandwidth.** Eight parallel transfers upload independent archive parts instead of funneling a large image through one transfer. Restores download parts concurrently, too. Google Drive remains your storage backend.
+- **Back up large VMs with little spare disk space.** VMs without snapshots stream compressed backups through a bounded spool: just 2.25 GiB of payload staging plus 1 GiB of free-space headroom with the defaults. You do not need room for a complete local backup before uploading.
+- **Verify before trusting an archive.** Each part and the complete payload have recorded checksums. Upload checks every part against remote metadata and verifies the manifest before marking an archive complete. Restore checks each part and the reconstructed whole-file SHA-256 before creating the VM. Optional full read-back adds independent upload verification.
+- **Wait out Google Drive upload quotas.** Recognized quota blocks retry hourly, up to 24 times by default. Streaming production pauses when the spool fills and continues when uploads can proceed. Retained recovery data lets eligible interrupted uploads and downloads resume.
+- **Keep supported QCOW2 snapshots intact.** VMs with supported internal snapshots use native archives that preserve exact QCOW2 bytes and Proxmox snapshot configuration. No disk conversion is involved.
+- **Keep administration focused on VMs.** Upload, list, and restore by VMID. Archives are organized by source node label and VMID, and incomplete attempts stay out of the complete-backup listing. Guarded cleanup removes abandoned attempts.
+- **Restore where you need the VM.** Choose another node, an unused VMID, or destination storage. Retain the source with `--keep-vm`, or reclaim its disks only after successful archive verification.
+
+## Three everyday commands
+
+After installation and remote configuration:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
+pve-drive --remote gdrive:pve-archive --source pve-site-a list
+pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
+```
+
+`--source` identifies the originating PVE node; keep that label when restoring elsewhere. Upload stops the VM. **Keep `--keep-vm` to retain the source; omitting it deletes the VM and its disks after successful verification.** Restore requires an unused destination VMID and leaves the restored VM stopped.
+
+## The right archive for the VM
+
+The normal upload command chooses automatically:
+
+| VM layout | Archive | Practical benefit |
+| --- | --- | --- |
+| No snapshots | Compressed multipart VMA | Parallel uploads with bounded local staging, even for very large disks. |
+| Supported internal QCOW2 snapshots | Native multipart QCOW2 and configuration | Exact disk bytes and supported snapshots preserved. Requires staging for the original QCOW2 file lengths. |
+
+The small upload spool applies to compressed VMA, which preserves backed-up guest disks and configuration rather than the original QCOW2 container bytes. Multipart restores stage downloaded parts and their verified reconstruction: allow twice the archive payload size plus 1 GiB, in addition to destination disk capacity.
+
+Quota recovery keeps the same VMA stream only while its producer remains alive. After interruption, fully produced VMA archives and native multipart uploads can resume from retained data; interrupted VMA production starts a new attempt. See the [administrator guide](ADMIN.md) for recovery details and supported layouts.
+
+Throughput depends on the host, compression, network, and Drive. The [benchmark guide](BENCHMARK.md) provides a reproducible comparison with single-file uploads. Transfer and part tuning are available under `upload --help` and `restore --help`; routine use needs no extra switches.
 
 **Status: experimental.** Validate upload, restore, and snapshot rollback with `--keep-vm` before enabling source VM deletion.
 
