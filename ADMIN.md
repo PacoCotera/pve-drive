@@ -1,163 +1,118 @@
-# Admin quick start — version 0.7.1
+# Administrator guide
 
-**Experimental:** complete a test upload, restore, and snapshot rollback before relying on VM deletion. Use `--keep-vm` for the first upload.
+For installation and everyday commands, see [README.md](README.md).
 
-## Install and update
+## Source identity and archive selection
 
-Clone once into a separate source directory:
+Run uploads on the VM’s owning node. Use a unique, stable `--source` label for each server; the tool does not enforce label ownership or connect to other nodes over SSH. A migrated VM may have older archives under its previous label.
 
-```bash
-git clone https://github.com/PacoCotera/pve-drive.git /opt/pve-drive &&
-cd /opt/pve-drive &&
-sudo ./install.sh
-```
+Archives use `REMOTE/sources/SOURCE/VMID/TIMESTAMP-UUID/`. The manifest records the source label, actual node name, VM configuration, date, and checksums. A verified `COMPLETE` marker makes an archive eligible for listing and restore.
 
-For later updates:
+`list` shows the latest complete version per VM, with VMID, NAME, SIZE, FORMAT, SNAPSHOTS, and ARCHIVED UTC. SIZE comes from the manifest; it is not guest disk capacity or Drive quota usage. The table appears after metadata loads. `list --all-versions` includes older versions and their backup IDs.
 
-```bash
-cd /opt/pve-drive
-git pull --ff-only && sudo ./install.sh
-```
+Restore selects the newest complete timestamp. A bad latest manifest fails rather than silently selecting an older copy. Existing VMIDs are never overwritten. Restored VMs stay stopped with current `onboot=0`; inspect hardware and networking before starting. `--unique` changes MAC addresses throughout native snapshot configurations, but not guest IPs or SMBIOS identity. Native archives spanning multiple storage IDs require a destination `--storage` override.
 
-The installed command is `/usr/local/sbin/pve-drive`. If that path is an old directory, the installer preserves it as `pve-drive.previous-<timestamp>-<suffix>` before installing the executable. VM disks, staging files, and rclone configuration are not moved. An active pve-drive task blocks installation until it finishes. The installer does not install dependencies: Git and Python 3 must already be available, along with rclone and the normal Proxmox tools for operation.
+Cloud archives are retained after restore. There is no automatic remote pruning.
 
-Keep using the same configured rclone remote and a unique source label for each server. Run `pve-drive --help` for usage.
+## Configuration and installation
 
-## Upload VM 100 and remove it from Proxmox
+The default rclone configuration is `/root/.config/rclone/rclone.conf`; override it with `--rclone-config PATH` before the command. Shared Drives use rclone’s `team_drive` setting, not `shared_with_me`. A service account needs suitable Drive membership. See [rclone’s Drive documentation](https://rclone.org/drive/), including its OAuth client setup.
 
-```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100
-```
+Crypt remotes require `--deep-verify` when they do not expose MD5. Preserve encryption keys and rclone configuration separately. Fast recovery requires remote MD5 support.
 
-The VM is shut down, archived, uploaded, and verified before deletion. Internal QCOW2 snapshots are preserved automatically for the supported directory-storage layout. Unsupported snapshot layouts stop with an error instead of discarding history. Add `--keep-vm` for a test upload that leaves the original VM stopped on the server.
+The installer places the executable at `/usr/local/sbin/pve-drive`. It preserves an old directory at that location as `pve-drive.previous-<timestamp>-<suffix>`. Installation is atomic and refused while a pve-drive task is active. It does not install dependencies or move VM disks, staging, or credentials.
 
-## List cloud VMs
+## Space and staging
 
-```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-a list
-```
+Default staging is `/var/lib/vz/pve-drive`. Check free space before starting. Native QCOW2 archives are uncompressed and can exceed the guest’s virtual disk capacity because of snapshots. Upload staging requires the full disk-file lengths plus 1 GiB. Restore requires space for a download and a destination copy: on one filesystem allow approximately twice the archive size plus headroom. Sparse savings are not assumed.
 
-Shows VMID, name, archive format, snapshot names, and archive date for the latest complete version of each VM. Internal backup IDs are hidden unless you request `list --all-versions`.
-
-## Restore VM 100
-
-```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
-```
-
-Selects the latest complete archive automatically, restores as VM 100 using its original storage, and leaves it stopped for inspection. It refuses to overwrite an existing VM. The cloud copy remains available. Start it when ready with `qm start 100`.
-
-To restore source VM 100 as VM 200, including on a different PVE server:
+To stage a restore on a larger filesystem:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  --work-dir /mnt/backup-space/pve-drive-staging \
   restore 100 --target-vmid 200 --storage destination-dir --unique
 ```
 
-Run this on the destination PVE. Keep the **original** source label (`pve-site-a`) to select the correct backup. `--target-vmid` selects the destination VMID; without it, the source VMID is reused. `--storage` overrides destination storage, and `--unique` generates new MAC addresses if the original VM will coexist. Native archives originally spanning multiple storage IDs require a destination `--storage` override. The script records both the source label and actual source node name in each backup manifest.
+Use an existing mounted filesystem with adequate space. `--storage` chooses restored disk storage; `--work-dir` chooses temporary staging independently.
 
-Successful upload/restore removes its temporary local files by default; append `--keep-local` to retain them. Failed operations retain recovery files. Allow staging space for the full archive size. Restore also needs space for the destination copy. Attached ISO contents and Proxmox host/cluster settings are not included; see README for supported resources and recovery details.
+Successful `upload` and `restore` remove staging by default; `--keep-local` retains it. Failures retain recovery files. `recover`, advanced `archive`, and `verify` retain staging unless `--cleanup-local` is supplied.
 
-The older `archive` and explicit-backup-ID restore commands remain available for advanced use. Simulated tests pass, but test a real restore and snapshot rollback before relying on VM deletion in production.
+## Supported archives and limitations
 
-## Retry a failed native local copy
+| VM layout | Archive format |
+| --- | --- |
+| No snapshots | zstd-compressed VMA via `vzdump`, restored with `qmrestore` |
+| Supported snapshots | Native QCOW2 files and full VM/snapshot configuration |
 
-Version 0.4.2 uses sequential reads/writes instead of accelerated `cp`. It verifies the complete file hash and retains mismatch diagnostics. This changes the copy method; an unexplained host mismatch still needs investigation if it recurs.
+Native mode requires VM-owned standalone QCOW2 files on directory storage, with identical disk attachments across snapshot sections. Each disk’s internal snapshot names must match Proxmox’s snapshot configuration. Backing chains, external data files, encryption, saved RAM, raw disks, cloud-init disks, and changing snapshot disk attachments are rejected. Native archives must be restored by this script, not the Proxmox VMA backup UI.
 
-After updating the script, a failed native copy from before manifest creation can reuse its existing staging directory:
+Native copying reads bytes sequentially, preserves zero-filled regions as sparse output, flushes the destination, and checks SHA-256. It does not convert QCOW2 images or use reflinks/copy offloading.
+
+Preflight rejects protected/template VMs, unsupported locks, pending configuration, HA/replication membership, unused or excluded data disks, passthrough devices, physical CD-ROMs, custom QEMU arguments, hooks, and external cloud-init snippets. Backup locks are accepted only by the matching resume/recovery paths. Standard cloud-init drives are supported in VMA mode only. LXC and Proxmox Backup Server repositories are not supported.
+
+Storage ISO references are retained, but ISO contents are not archived. Reattach or eject unavailable media before starting a restored VM. Host bridges, storage definitions, firewall files, cluster permissions, HA settings, and other host resources are not packaged.
+
+Use a maintenance window: do not start, modify, migrate, unlock, or replace a VM during an operation. The tool serializes its own tasks per node and uses Proxmox locks; administrators can still bypass them. Site defaults and hooks in `/etc/vzdump.conf` apply to VMA backups. Deletion is not transactional: storage errors may leave a partial deletion. Test a real restore and snapshot rollback before relying on deletion.
+
+## Verification
+
+By default, upload compares every payload file’s size and MD5 with remote metadata. Missing/malformed hashes, mismatches, missing/extra files, or duplicate paths fail before the completion marker or VM deletion. There is no size-only fallback. This reads local files for hashing but does not download the archive again.
+
+For an independent read of stored bytes, or a remote without MD5, select full read-back at upload time:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  upload 100 --keep-vm --deep-verify
+```
+
+Local copy checks, manifest checks, and restore SHA-256 checks remain required. Standalone `verify BACKUP_ID` always downloads and validates SHA-256. Checksums establish file integrity, not guest/application health. The completion marker is not a signature; restrict remote write access. Remote immutability is a tool convention, not a Drive permission guarantee.
+
+## Recovery
+
+First confirm the original operation has stopped. Inspect its log, staging path, `qm status VMID`, and `qm config VMID`. Do not manually unlock a VM before using either recovery path below.
+
+### Failed native local copy, before a manifest exists
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \
   upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm
 ```
 
-Use the exact staging directory printed by your failed operation. Leave the VM stopped with its backup lock; do not unlock before this command. Resume verifies the full VM/snapshot configuration, replaces the failed local copies in that same directory, then performs all normal checks. It does not create a second staging directory. It is not a general interrupted-upload resume and refuses stages with a manifest or completion marker. `--keep-vm` retains the original VM for this recovery test. Sparse output is based only on buffers actually read as zero; filesystem hole reporting and reflinks are not used. Disk-full or integrity errors still stop the operation and retain recovery files.
+Use the exact printed staging path. The original VM must remain stopped and backup-locked, with matching full configuration. This replaces failed local copies in the same staging directory and continues normal upload checks. It refuses stages that already contain a manifest or completion marker. Hash failures retain `copy-mismatch.json` with sizes, timestamps, and checksum diagnostics; they cannot be bypassed.
 
-## Built-in help
-
-Run `pve-drive --help`, `pve-drive upload --help`, `pve-drive list --help`, or `pve-drive restore --help` for examples and defaults. Global options go before the command. Wait for active uploads/restores to finish before running the installer.
-
-## Progress and troubleshooting
-
-The default display shows stages and elapsed time. Disk copying, SHA-256 checks,
-and rclone transfers show percentage, bytes, speed, and estimated time remaining
-when totals are available. Stages without measurable byte progress show elapsed
-time only. Optional deep verification reads the entire archive back from the cloud.
-An interactive terminal refreshes the progress line; redirected output prints
-periodic lines without terminal control codes.
-
-Each run prints the path of its private diagnostic log under `/var/log/pve-drive/`.
-Logs include commands, tool output, and archive IDs. They can contain VM names,
-configuration, and storage paths: review before sharing. Logs are retained;
-remove old logs when no longer needed.
-
-To show raw commands and tool output as well, put `--verbose` before the command:
-
-```bash
-pve-drive --verbose --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
-```
-
-Display updates take effect on the next run after installation. Let an active
-upload or restore finish before updating.
-
-## Upload verification modes
-
-The default upload/archive verification compares every local payload file's size
-and MD5 against the remote's stored metadata. Google Drive supports MD5 for these
-binary files. This reads the local files for hashing but does not download the
-archive again. Local SHA-256 copy checks, manifest checks, restore SHA-256 checks,
-and the completion marker remain required.
-
-Missing or malformed MD5 hashes, mismatches, missing/extra files, and duplicate
-remote paths stop the operation before completion-marker publication or VM deletion.
-There is no fallback to size-only checks. For remotes without MD5 support, select
-full read-back verification when starting the upload:
-
-```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --deep-verify --keep-vm
-```
-
-`archive` also accepts `--deep-verify`. The standalone `verify BACKUP_ID` command
-continues to download the backup and validate SHA-256; it audits existing archives.
-Metadata verification detects transfer corruption but is not an independent read
-of the stored bytes. Use deep verification when that additional check is wanted.
-This change removes the default verification download; it does not accelerate the
-upload itself. An already running operation keeps its original verification mode.
-
-## Recover an upload interrupted during verification
-
-If the archive files reached Drive but verification was interrupted, use `recover`
-on the original PVE node with the original source label and exact staging path:
+### Uploaded files, interrupted verification or finalization
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \
   recover 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE
 ```
 
-Stop the original pve-drive operation first. Leave the VM stopped and backup-locked;
-do not manually unlock it. The command requires the saved manifest and complete
-local payload. It validates the source/node/VM identity, saved configuration,
-local SHA-256 hashes, disk integrity, and remote file sizes/MD5 hashes. SHA-256 and
-MD5 are computed together in one local read. It does not recopy disks, reupload
-archive files, or download the archive. Only the small completion marker is
-uploaded and read back. Both native QCOW2 and VMA archives are supported.
+Run on the original source node with the original source label, complete local payload, and saved manifest. The VM must remain stopped and backup-locked. Recovery checks identity, configuration, local SHA-256, disk integrity, and cloud sizes/MD5. It computes SHA-256 and MD5 in one local read; it does not recopy, reupload, or download archive data. Only the completion marker is uploaded and read back.
 
-On success the cloud backup becomes available to `list` and `restore`, and the
-original VM is retained, stopped, and unlocked. Recovery never deletes a VM.
-Staging is retained by default; append `--cleanup-local` to remove it after success.
-Missing/corrupt files, wrong source/node/configuration, unavailable MD5, or a failed
-marker write leave recovery incomplete and the VM locked. A retry accepts an
-already published matching marker if the VM still holds its backup lock.
+On success, the archive becomes available to `list`/`restore`, and the VM is retained, stopped, and unlocked. Recovery never deletes the VM. Staging is retained unless `--cleanup-local` is supplied. A matching existing cloud marker permits retry while the VM still holds its backup lock. Missing cloud files cannot be repaired by `recover`; they require a separate upload.
 
-`upload --resume` repairs a failed local copy before a manifest exists;
-`recover --resume` finalizes an existing upload after a manifest exists. Recovery
-does not upload missing files or bypass verification. An incomplete cloud payload
-requires a separate upload; it cannot be marked complete by this command.
+### Other failures
+
+Incomplete remote folders without `COMPLETE` are ignored by listing and automatic restore. Rclone retries transient errors within an operation; a fresh upload creates a new version. Neither recovery command provides general interrupted-download resumption.
+
+Interrupted native restores may leave a create-locked placeholder VM and allocated disks. Staging’s `restore-state.json` records allocations, including disks that may not yet be attached. Inspect before cleanup; do not simply unlock and start the placeholder. VMA restore failures can also leave partial VMs. The script does not automatically delete these allocations and will refuse to overwrite the VMID on retry.
+
+If only final cleanup failed, the operation may already have succeeded. Inspect state before retrying. Manually remove partial local/remote copies only after confirming what they contain. To abandon a failed operation, unlock manually only after all related tasks have stopped and the VM state has been checked.
+
+## Diagnostics and advanced commands
+
+Progress shows elapsed time, percentage, speed, and ETA when measurable. Each run prints its log path under `/var/log/pve-drive/`. Logs are retained and may include VM configuration and paths; review before sharing. Add `--verbose` before the command to display raw commands and tool output.
+
+Advanced `archive` selects a format explicitly and requires `--keep-vm` or `--delete-vm`. VMA does not preserve snapshots; deleting a snapshotted VM in that mode requires explicit `--allow-snapshot-loss`. Routine `upload` never enables that flag.
+
+Use `list --all-versions` to select a specific archive:
 
 ```bash
-pve-drive recover --help
+pve-drive --remote gdrive:pve-archive --source pve-site-a verify BACKUP_ID --cleanup-local
+pve-drive --remote gdrive:pve-archive --source pve-site-a restore BACKUP_ID 200 --storage destination-dir --unique
 ```
 
-## Archive listing
+Old `move-to-cloud`/`move-from-cloud` aliases remain available. `--legacy-layout` replaces `--source` for reading archives from before source folders existed; it does not allow uploads or recovery.
 
-`list` displays VMID, NAME, SIZE, FORMAT, SNAPSHOTS, and ARCHIVED UTC in aligned columns. SIZE is the recorded archive size from the manifest, including native snapshot data; it is not the guest virtual disk capacity or Drive quota usage. No extra Drive requests are needed for size. The command displays "Loading cloud archives..." while fetching metadata, then prints the complete table. `--all-versions` also shows BACKUP ID.
+Run `pve-drive COMMAND --help` for command options. From the checkout, `python3 -m unittest discover -s tests -v` runs simulated lifecycle tests and local copy/installer checks. These tests do not replace end-to-end Proxmox restore and snapshot rollback validation.
