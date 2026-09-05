@@ -50,7 +50,7 @@ The example archives VM `100` to `gdrive:pve-archive` under source identifier `p
 | Argument | Description |
 | --- | --- |
 | `--remote gdrive:pve-archive` | Destination folder `pve-archive` on the configured rclone remote `gdrive`. |
-| `--source pve-site-a` | Persistent archive identifier for the source node. Use the same identifier for listing and restoration, including restoration on another node. This value identifies archives; it is not a connection address. |
+| `--source pve-site-a` | Persistent identifier for the source node. Use the same identifier for listing and restoration, including restoration on another node. |
 | `upload` | Archive and verify the VM. Execute on the node that owns the source VM. |
 | `100` | Proxmox ID of the source VM. |
 | `--keep-vm` | Retain the source VM and its disks after verification. The VM remains stopped. |
