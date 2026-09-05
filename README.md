@@ -29,24 +29,31 @@ rclone lsd gdrive:
 rclone mkdir gdrive:pve-archive
 ```
 
-The examples below use these values; replace them with your own:
+## Command structure
 
-| Parameter | Meaning |
-| --- | --- |
-| `--remote gdrive:pve-archive` | Cloud destination: `gdrive` is the remote you created in rclone, and `pve-archive` is the folder inside it. |
-| `--source pve-site-a` | A unique label you choose for the source Proxmox server. Keep using that original label when listing or restoring its VMs, even on another server. |
-| `upload 100` | The action (`upload`) followed by the existing Proxmox VM ID (`100`). Use `list` to browse archives or `restore 100` to restore that source VM’s latest archive. |
-| `--keep-vm` | Keep the original VM after a successful upload. It will be shut down and left stopped. Without this flag, upload deletes the original VM and its disks after verification. |
+```text
+pve-drive --remote <REMOTE:FOLDER> --source <SOURCE_LABEL> <COMMAND> [VMID] [OPTIONS]
+```
 
-Put global options such as `--remote` and `--source` **before** the action, and action-specific options such as `--keep-vm` **after** it. `--source` identifies the server’s archives; it does not connect to that server. Run uploads on the VM’s owning node.
+Replace `<...>` with your values; brackets indicate optional arguments and are not typed. `upload` and `restore` require a VM ID; `list` does not. Global options (`--remote`, `--source`, `--work-dir`) go before the command; command options go after it.
 
 ## Upload, list, restore
 
-Upload and verify a test archive, keeping the original VM stopped:
+For example, to upload a test archive:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
 ```
+
+This command shuts down VM **100**, archives it in **pve-archive** on the **gdrive** remote, labels the archive’s source **pve-site-a**, and keeps the original VM stopped on the server.
+
+| Part of the sample | Meaning |
+| --- | --- |
+| `--remote gdrive:pve-archive` | `gdrive` is the remote configured in rclone; `pve-archive` is the folder inside it. |
+| `--source pve-site-a` | A unique label you choose for this source Proxmox server. Reuse it when listing or restoring its archives, even on another server. It does not connect to that server. |
+| `upload` | Archive the VM and verify the uploaded files. Run this on the VM’s owning node. |
+| `100` | The existing Proxmox VM ID to archive. Replace it with yours. |
+| `--keep-vm` | Retain the original VM after verification, shut down and stopped. |
 
 **Omit `--keep-vm` to delete the original VM and its disks after successful verification.**
 
