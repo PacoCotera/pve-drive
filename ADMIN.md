@@ -1,4 +1,4 @@
-# Admin quick start — version 0.4.0
+# Admin quick start — version 0.4.2
 
 Copy `pve_drive.py` onto the Proxmox server. Keep using the same configured rclone remote and a unique source label for each server.
 
@@ -38,3 +38,16 @@ Run this on the destination PVE. Keep the **original** source label (`pve-site-a
 Successful upload/restore removes its temporary local files by default; append `--keep-local` to retain them. Failed operations retain recovery files. Allow staging space for the full archive size. Restore also needs space for the destination copy. Attached ISO contents and Proxmox host/cluster settings are not included; see README for supported resources and recovery details.
 
 The older `archive` and explicit-backup-ID restore commands remain available for advanced use. Simulated tests pass, but test a real restore and snapshot rollback before relying on VM deletion in production.
+
+## Retry a failed native local copy
+
+Version 0.4.2 uses sequential reads/writes instead of accelerated `cp`. It verifies the complete file hash and retains mismatch diagnostics. This changes the copy method; an unexplained host mismatch still needs investigation if it recurs.
+
+After updating the script, a failed native copy from before manifest creation can reuse its existing staging directory:
+
+```bash
+python3 pve_drive.py --remote gdrive:pve-archive --source pve-site-a \
+  upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm
+```
+
+Use the exact staging directory printed by your failed operation. Leave the VM stopped with its backup lock; do not unlock before this command. Resume verifies the full VM/snapshot configuration, replaces the failed local copies in that same directory, then performs all normal checks. It does not create a second staging directory. It is not a general interrupted-upload resume and refuses stages with a manifest or completion marker. `--keep-vm` retains the original VM for this recovery test. Sparse output is based only on buffers actually read as zero; filesystem hole reporting and reflinks are not used. Disk-full or integrity errors still stop the operation and retain recovery files.
