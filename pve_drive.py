@@ -7,14 +7,17 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import threading
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.7.3'
+__version__ = '0.8.0'
 
 
 def duration(seconds):
@@ -83,6 +86,10 @@ class Console:
             text = (f'{self.phase} | {min(100, 100 * done / total):5.1f}% | '
                     f'{human_bytes(done)} / {human_bytes(total)} | '
                     f'{human_bytes(speed)}/s | elapsed {duration(elapsed)} | ETA {eta}')
+        elif done is not None:
+            speed = done / max(elapsed, .001) if speed is None else max(0, speed)
+            text = (f'{self.phase} | {human_bytes(done)} | {human_bytes(speed)}/s | '
+                    f'elapsed {duration(elapsed)} | total size unknown')
         else:
             text = f'{self.phase} | elapsed {duration(elapsed)}'
         if tty:
@@ -192,6 +199,132 @@ def run(*args, capture=False):
                     detail = f.read().decode(errors='replace').strip()
             raise RuntimeError(f'{args[0]} failed (exit {proc.returncode}): {detail}')
         return out_path.read_text(errors='replace') if capture else None
+
+
+def stream_pipeline(producer_args, upload_args, check_args, stage, *,
+                    downstream_args=None, total=None, producer_name='vzdump'):
+    """Relay and hash compressed bytes without an archive file or unbounded queue."""
+    stage = Path(stage)
+    processes, readers = [], []
+    worker = None
+    state = {'size': 0}
+    errors = []
+    digest = hashlib.sha256()
+    md5 = hashlib.md5(usedforsecurity=False)
+    with ExitStack() as stack:
+        def launch(name, args, **pipes):
+            args = list(map(str, args))
+            console.command(args)
+            path = stage / (name + '.log')
+            err = stack.enter_context(path.open('wb'))
+            reader = stack.enter_context(path.open('r', errors='replace'))
+            readers.append(reader)
+            proc = subprocess.Popen(args, stderr=err, start_new_session=(os.name == 'posix'), **pipes)
+            processes.append((name, proc))
+            return proc
+
+        def drain():
+            for reader in readers:
+                # Only diagnostics are stored/read here, never archive bytes.
+                while True:
+                    text = reader.read(65536)
+                    if not text:
+                        break
+                    console.output(text)
+
+        def stop():
+            # Let vzdump handle an interrupt and stop its temporary backup VM.
+            for name, proc in processes:
+                if proc.poll() is None:
+                    try:
+                        if os.name == 'posix':
+                            os.killpg(proc.pid, signal.SIGINT if name == 'vzdump' else signal.SIGTERM)
+                        else:
+                            proc.terminate()
+                    except ProcessLookupError:
+                        pass
+            for _, proc in processes:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    if os.name == 'posix':
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        proc.kill()
+                    proc.wait()
+
+        try:
+            destination = subprocess.DEVNULL
+            if downstream_args is not None:
+                output_path = stage / 'qmrestore-output.log'
+                output = stack.enter_context(output_path.open('wb'))
+                readers.append(stack.enter_context(output_path.open('r', errors='replace')))
+                downstream = launch('qmrestore', downstream_args, stdin=subprocess.PIPE, stdout=output)
+                destination = downstream.stdin
+            uploader = launch('zstd' if downstream_args else 'rclone', upload_args,
+                              stdin=subprocess.PIPE, stdout=destination)
+            if downstream_args is not None:
+                downstream.stdin.close()  # Only the decompressor owns the write end.
+            checker = (launch('zstd-check', check_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+                       if check_args else None)
+            producer = launch(producer_name, producer_args, stdout=subprocess.PIPE)
+
+            def relay():
+                try:
+                    while True:
+                        chunk = producer.stdout.read1(1024 * 1024)
+                        if not chunk:
+                            break
+                        if total is not None and state['size'] + len(chunk) > total:
+                            raise ValueError('Stream exceeds the expected archive size')
+                        # Buffered pipe writes apply backpressure from both consumers.
+                        for sink in ([checker.stdin, uploader.stdin] if checker else [uploader.stdin]):
+                            sink.write(chunk)
+                        digest.update(chunk)
+                        md5.update(chunk)
+                        state['size'] += len(chunk)
+                    if checker:
+                        checker.stdin.close()
+                    uploader.stdin.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            console.stage('Streaming restore from cloud' if downstream_args else 'Streaming compressed backup to cloud')
+            worker = threading.Thread(target=relay, daemon=True)
+            worker.start()
+            while worker.is_alive() or any(proc.poll() is None for _, proc in processes):
+                drain()
+                failed = [(name, proc.returncode) for name, proc in processes
+                          if proc.poll() is not None and proc.returncode != 0]
+                if failed:
+                    raise RuntimeError(f'Stream process failed: {failed}; see {stage}')
+                if errors:
+                    raise RuntimeError(f'Stream pipe failed: {errors[0]}; see {stage}') from errors[0]
+                console.update(state['size'], total)
+                time.sleep(.2)
+            if errors or any(proc.returncode != 0 for _, proc in processes) or not state['size']:
+                raise RuntimeError(f'Incomplete or empty backup stream; see {stage}')
+            drain()
+            console.update(state['size'], total, force=True)
+            return dict(state, sha256=digest.hexdigest(), md5=md5.hexdigest())
+        except BaseException:
+            stop()
+            raise
+        finally:
+            if worker is not None:
+                worker.join(timeout=10)
+            for _, proc in processes:
+                for pipe in (proc.stdin, proc.stdout):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
+            drain()
+            console.clear()
 
 
 def file_hash(path, algorithm='sha256'):
@@ -602,6 +735,10 @@ class Manager:
             raise ValueError('Resolve pending VM configuration changes before archiving')
         snapshots = self.api(self.vm_path(ident) + '/snapshot')
         snapshot_names = [s['name'] for s in snapshots if s.get('name') != 'current']
+        if getattr(self.a, 'stream', False):
+            if snapshot_names or getattr(self.a, 'resume', None) or getattr(self.a, 'deep_verify', False):
+                raise ValueError('--stream requires no snapshots and cannot be combined with --resume or --deep-verify')
+            return self.archive_stream(ident, cfg, external_media)
         if self.a.format == 'native-qcow2' or (self.a.format == 'auto' and snapshot_names) or getattr(self.a, 'resume', None):
             return self.archive_native(ident, cfg, snapshot_names)
         if snapshot_names:
@@ -672,6 +809,126 @@ class Manager:
         self.finish_staging(stage)
         console.note('Archive complete. VM ' + ('deleted.' if self.a.delete_vm else 'retained, stopped.'))
 
+    def archive_stream(self, ident, cfg, external_media):
+        features = json.loads(self.rc('backend', 'features', self.base, capture=True))
+        if features.get('Features', {}).get('PutStream') is not True:
+            raise ValueError('Remote cannot stream without local spooling; use a streaming-capable remote')
+        if 'md5' not in [str(h).lower() for h in features.get('Hashes', [])]:
+            raise ValueError('Streaming requires remote MD5 support for verification')
+        self.rc('mkdir', self.base)
+        self.rc('lsjson', self.base, '--max-depth', '1', capture=True)
+        stage = self.stage(f'stream-{ident}-')
+        stamp = datetime.now(timezone.utc)
+        bid = f'{ident}/{stamp:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}'
+        destination = f'{self.base}/{bid}'
+        filename = f'vzdump-qemu-{ident}-{stamp:%Y_%m_%d-%H_%M_%S}.vma.zst'
+        # Save the exact attempt destination even if streaming never completes.
+        (stage / 'attempt.json').write_text(json.dumps({'destination': destination, 'backup_id': bid}) + '\n')
+        console.note(f'Cloud attempt: {destination}')
+        run('qm', 'shutdown', ident, '--timeout', self.a.shutdown_timeout)
+        self.unchanged(ident, cfg.copy())
+        tmp = stage / 'tmp'
+        tmp.mkdir()
+        result = stream_pipeline(
+            ['vzdump', ident, '--mode', 'stop', '--compress', 'zstd', '--stdout', '1',
+             '--tmpdir', str(tmp), '--remove', '0'],
+            ['rclone', '--config', self.a.rclone_config, '--retries', '1', '--low-level-retries', '10',
+             'rcat', destination + '/' + filename, '--streaming-upload-cutoff', '1M',
+             '--buffer-size', '8M', '--drive-chunk-size', '32M'],
+            ['zstd', '--test', '-'], stage)
+        # Successful processes are necessary, but also require every configured
+        # data disk to be acknowledged by vzdump before certifying the stream.
+        expected_disks = {key: str(value).split(',')[0] for key, value in cfg.items()
+                          if DISK_KEY.fullmatch(key) and 'media=cdrom' not in str(value).split(',')}
+        included = {}
+        with (stage / 'vzdump.log').open(errors='replace') as log:
+            for line in log:
+                match = re.search(r"include disk '([^']+)' '([^']+)'", line)
+                if match:
+                    included[match[1]] = match[2]
+        if not expected_disks or included != expected_disks:
+            raise ValueError('Stream disk inventory differs from VM configuration; VM retained')
+        self.unchanged(ident, cfg.copy())
+        payload = stage / 'payload'
+        payload.mkdir()
+        manifest = {'schema': 2, 'backup_id': bid, 'vmid': int(ident), 'source': self.a.source,
+                    'source_node': Path('/etc/pve/local').resolve().name, 'config': cfg,
+                    'external_media': external_media, 'excluded_snapshots': [],
+                    'created_utc': stamp.isoformat(), 'filename': filename, 'streamed': True,
+                    'included_disks': included, **result}
+        manifest_path = payload / 'manifest.json'
+        with manifest_path.open('x', newline='\n') as f:
+            f.write(json.dumps(manifest, indent=2) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+        # Receipt exists only after producer, uploader, zstd and inventory checks
+        # succeeded. Recovery must never certify an interrupted producer stream.
+        with (stage / 'stream-complete.json').open('x') as f:
+            json.dump({'manifest_sha256': sha256(manifest_path)}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        latest = self.config(ident)
+        self.unchanged(ident, cfg.copy())
+        if 'lock' in latest:
+            raise ValueError('VM became locked')
+        run('qm', 'set', ident, '--lock', 'backup', '--digest', latest['digest'])
+        self.finalize_stream(ident, stage, manifest, delete_vm=self.a.delete_vm)
+
+    def finalize_stream(self, ident, stage, manifest, delete_vm=False):
+        expected = dict(manifest['config'], lock='backup')
+        self.unchanged(ident, expected.copy())
+        destination = self.base + '/' + manifest['backup_id']
+        payload = stage / 'payload'
+        path = payload / 'manifest.json'
+        manifest_sha, manifest_md5 = file_hash(path, 'both')
+        checks = {manifest['filename']: (manifest['size'], manifest['md5']),
+                  'manifest.json': (path.stat().st_size, manifest_md5)}
+        # This is a small metadata upload; disk bytes never pass through rc().
+        self.rc('copyto', path, destination + '/manifest.json', '--immutable')
+        self.verify_upload(payload, destination, local_checks=checks, completion_hash=manifest_sha)
+        self.unchanged(ident, expected.copy())
+        marker = stage / 'COMPLETE'
+        marker.write_bytes((manifest_sha + '\n').encode('ascii'))
+        self.rc('copyto', marker, destination + '/COMPLETE', '--immutable')
+        if self.rc('cat', destination + '/COMPLETE', capture=True) != marker.read_text():
+            raise ValueError('Completion marker verification failed')
+        self.unchanged(ident, expected.copy())
+        if delete_vm:
+            run('qm', 'destroy', ident, '--skiplock', '1', '--purge', '1')
+            if any(str(x.get('vmid')) == ident for x in self.api('/cluster/resources')):
+                raise ValueError('VM still appears in cluster')
+        else:
+            run('qm', 'unlock', ident)
+        self.finish_staging(stage)
+        console.note('Stream archive complete. VM ' + ('deleted.' if delete_vm else 'retained, stopped and unlocked.'))
+
+    def recover_stream(self, ident, stage):
+        payload = stage / 'payload'
+        path = payload / 'manifest.json'
+        receipt = stage / 'stream-complete.json'
+        marker = stage / 'COMPLETE'
+        if (payload.is_symlink() or not payload.is_dir() or path.is_symlink() or not path.is_file()
+                or receipt.is_symlink() or not receipt.is_file() or marker.is_symlink()
+                or (marker.exists() and not marker.is_file())):
+            raise ValueError('No valid completed-stream receipt. An interrupted stream must be uploaded again.')
+        if {p.name for p in payload.iterdir()} != {'manifest.json'}:
+            raise ValueError('Unexpected stream recovery payload files')
+        if json.loads(receipt.read_text()).get('manifest_sha256') != sha256(path):
+            raise ValueError('Stream recovery manifest checksum mismatch')
+        manifest = json.loads(path.read_text())
+        self.validate_manifest(manifest, backup_id(manifest.get('backup_id', '')))
+        if (manifest.get('streamed') is not True or manifest['schema'] != 2 or
+                str(manifest['vmid']) != ident or
+                manifest.get('source_node') != Path('/etc/pve/local').resolve().name or
+                not re.fullmatch(r'[a-f0-9]{32}', manifest.get('md5', ''))):
+            raise ValueError('Invalid stream recovery identity or checksum')
+        cfg = self.config(ident)
+        if 'lock' not in cfg:
+            self.unchanged(ident, manifest['config'].copy())
+            run('qm', 'set', ident, '--lock', 'backup', '--digest', cfg['digest'])
+        console.note('Recovering completed stream using cloud checksums; VM will be retained')
+        self.finalize_stream(ident, stage, manifest)
+
     def manifest(self, bid):
         destination = f'{self.base}/{backup_id(bid)}'
         marker = self.rc('cat', f'{destination}/COMPLETE', capture=True).strip()
@@ -701,8 +958,10 @@ class Manager:
         requested = Path(self.a.resume)
         stage = requested.resolve()
         if (requested.is_symlink() or stage.parent != self.work or
-                not stage.name.startswith((f'native-{ident}-', f'archive-{ident}-'))):
+                not stage.name.startswith((f'native-{ident}-', f'archive-{ident}-', f'stream-{ident}-'))):
             raise ValueError('Recovery requires this VM staging directory directly under --work-dir')
+        if stage.name.startswith(f'stream-{ident}-'):
+            return self.recover_stream(ident, stage)
         payload = stage / 'payload'
         if not payload.is_dir() or payload.is_symlink():
             raise ValueError('Invalid recovery payload directory')
@@ -804,6 +1063,8 @@ class Manager:
         ident = vmid(self.a.vmid)
         if any(str(x.get('vmid')) == ident for x in self.api('/cluster/resources')):
             raise ValueError('Target VMID already exists in cluster; refusing overwrite')
+        if getattr(self.a, 'stream', False):
+            return self.restore_stream(ident)
         stage, archive = self.download()
         if isinstance(archive, dict):
             return self.restore_native(ident, stage, archive)
@@ -818,6 +1079,55 @@ class Manager:
         self.stopped(ident)
         self.finish_staging(stage)
         console.note(f'Restored VM {ident}, stopped with onboot disabled. Cloud archive retained.')
+
+    def restore_stream(self, ident):
+        destination, manifest = self.manifest(self.a.backup_id)
+        if manifest.get('schema') == 3:
+            raise ValueError('--stream restore supports VMA archives only; native QCOW2 needs staged restore')
+        report_media(manifest.get('external_media', {}))
+        report_pci(manifest.get('config', {}))
+        console.stage('Checking cloud archive metadata')
+        rows = json.loads(self.rc('lsjson', destination, '--files-only', '--hash', capture=True))
+        archives = [row for row in rows if row.get('Path') == manifest['filename']]
+        if len(archives) != 1 or archives[0].get('Size') != manifest['size']:
+            raise ValueError('Cloud archive missing, duplicated or wrong size')
+        # Older staged archives have SHA-256 only. All streams are checked against
+        # that SHA-256 while reading; newer archives also have a preflight MD5.
+        if manifest.get('md5'):
+            hashes = {k.lower(): v.lower() for k, v in archives[0].get('Hashes', {}).items()}
+            if hashes.get('md5') != manifest['md5']:
+                raise ValueError('Cloud archive MD5 mismatch or unavailable')
+        stage = self.stage(f'stream-restore-{ident}-')
+        state = {'vmid': ident, 'backup_id': self.a.backup_id, 'status': 'restoring'}
+        state_path = stage / 'restore-state.json'
+        state_path.write_text(json.dumps(state) + '\n')
+        args = ['qmrestore', '-', ident, '--start', '0']
+        if self.a.storage:
+            args += ['--storage', self.a.storage]
+        if self.a.unique:
+            args += ['--unique', '1']
+        try:
+            result = stream_pipeline(
+                ['rclone', '--config', self.a.rclone_config, '--retries', '1', '--low-level-retries', '10',
+                 'cat', destination + '/' + manifest['filename']],
+                ['zstd', '--decompress', '--stdout', '-'], None, stage,
+                downstream_args=args, total=manifest['size'], producer_name='rclone-download')
+            # Keep an installed VM locked until the received bytes are validated.
+            run('qm', 'set', ident, '--onboot', '0', '--lock', 'backup')
+            self.stopped(ident)
+            if result['size'] != manifest['size'] or result['sha256'] != manifest['sha256']:
+                raise ValueError('Stream SHA-256/size mismatch; do not start the restored VM')
+            run('qm', 'unlock', ident)
+        except BaseException:
+            state['status'] = 'failed-unverified'
+            state_path.write_text(json.dumps(state) + '\n')
+            console.note(f'Restore not verified. Inspect target VM {ident} and {stage}; do not start it. '
+                         'Partial destination disks may remain. Cloud archive retained.')
+            raise
+        state['status'] = 'complete'
+        state_path.write_text(json.dumps(state) + '\n')
+        self.finish_staging(stage)
+        console.note(f'Stream restore complete: VM {ident} stopped, onboot disabled. Cloud archive retained.')
 
     def listing(self):
         console.stage('Loading cloud archives...')
@@ -1137,8 +1447,11 @@ def parser():
     recovery = sub.add_parser('recover', help='Finalize an interrupted upload using its existing staging files',
         description='Verify existing local files with SHA-256 and cloud files with size/MD5, publish the completion marker, '
                     'and unlock the original stopped VM. Never deletes the VM or uploads archive data. '
-                    'Requires a manifest in the staging directory, the original source node, and a backup-locked VM. '
-                    'Missing/incomplete cloud files fail; remotes must expose MD5.')
+                    'Requires a manifest in the staging directory and the original source node. '
+                    'Staged recovery requires a backup-locked VM; streamed recovery requires a completed-stream receipt '
+                    'and a stopped unchanged VM, and may acquire its backup lock. '
+                    'Missing/incomplete cloud files fail; remotes must expose MD5. '
+                    'Stream recovery may upload small manifest/marker files, never archive data.')
     recovery.add_argument('vmid', type=vmid)
     recovery.add_argument('--resume', required=True, metavar='STAGING_DIR', help='Exact existing staging directory printed by the interrupted upload')
     recovery.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True,
@@ -1147,12 +1460,14 @@ def parser():
     to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM, verify, then delete VM',
         description='Shut down the source VM, select the archive format automatically, upload and verify, then delete it. '
                     'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history. '
-                    'Direct GPU/HD-audio passthrough is supported; host hardware is not archived.',
+                    'Direct GPU/HD-audio passthrough is supported; host hardware is not archived. '
+                    '--stream avoids a local archive for VMs without snapshots.',
         epilog='Resume is only for a failed native LOCAL COPY before a manifest was created. '
                'Use the exact printed staging path, keep the VM stopped and backup-locked, and do not unlock first. '
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
+    to.add_argument('--stream', action='store_true', help='Stream VMA directly to cloud without a local archive; requires no snapshots and remote streaming/MD5 support. Interrupted streams restart from the beginning')
     to.add_argument('--deep-verify', action='store_true', help='Verify upload by downloading it again (default: require matching cloud sizes and MD5 hashes)')
     to.add_argument('--resume', metavar='STAGING_DIR', help='Retry a failed native local copy in its existing staging directory')
     to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain staging after success (default: remove it); failures retain files')
@@ -1179,7 +1494,9 @@ def parser():
         description='Select the latest complete backup for --source and VMID. Restore to the original VMID/storage '
                     'unless overridden. Existing VMIDs are never overwritten. The restored VM stays stopped '
                     'with onboot disabled; the cloud archive is retained. '
-                    'Review retained PCI passthrough assignments before starting the VM on the destination.',
+                    'Review retained PCI passthrough assignments before starting the VM on the destination. '
+                    '--stream restores VMA directly without staging; SHA-256 is checked during restoration '
+                    'and failures may leave partial destination disks.',
         epilog='Run on the DESTINATION PVE but keep the ORIGINAL --source label. '
                '--unique changes MAC addresses, not guest static IPs. '
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100 --target-vmid 200 --storage destination-dir --unique. '
@@ -1189,6 +1506,7 @@ def parser():
     r.add_argument('--target-vmid', type=vmid, help='Restore the selected source VM under another VMID')
     r.add_argument('--storage', help='Override original storage on destination server')
     r.add_argument('--unique', action='store_true', help='Generate new MAC addresses')
+    r.add_argument('--stream', action='store_true', help='Restore a VMA archive directly from cloud without staging; verify SHA-256 while restoring. Failure may leave partial target disks')
     r.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain downloaded files after success (default: remove them)')
     r.add_argument('--cleanup-local', action='store_true', help=argparse.SUPPRESS)
     listing = sub.add_parser('list', help='List latest complete cloud archive for each source VM',
@@ -1208,6 +1526,9 @@ def main():
     args = parser().parse_args()
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise ValueError('Run as root on Linux (archive/restore require a Proxmox node)')
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f'Received signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
     import fcntl
     os.umask(0o077)
     log_dir = Path('/var/log/pve-drive')

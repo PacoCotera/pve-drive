@@ -38,6 +38,31 @@ Use an existing mounted filesystem with adequate space. `--storage` chooses rest
 
 Successful `upload`, `restore`, and `recover` remove staging by default; `--keep-local` retains it. Failed operations preserve recovery data; empty staging directories are removed when the initial space check fails. Advanced `archive` and `verify` retain staging unless `--cleanup-local` is supplied.
 
+## Streaming upload and restore
+
+`upload VMID --stream` sends a zstd-compressed VMA directly from `vzdump --stdout` to `rclone rcat`. The relay uses bounded buffers, calculates SHA-256 and MD5, and feeds the same compressed bytes to `zstd --test`. It requires successful exits from all processes and checks that vzdump included every configured data disk. Cloud size and MD5 verification, manifest verification, and completion-marker read-back must succeed before source VM deletion.
+
+Preflight requires the remote to advertise `PutStream` and MD5 support. Remotes that would spool an unknown-size upload to local disk are rejected. `--stream` cannot be combined with snapshots, `--resume`, or `--deep-verify`; use staged upload for those cases. Small logs, temporary Proxmox metadata, and recovery receipts remain under `--work-dir`. `--keep-local` retains these files, not an archive. Upload progress reports compressed bytes passed to the uploader, average rate, and elapsed time; final compressed size and ETA are unknown until the stream ends. A successful uploader exit and metadata verification establish remote completion.
+
+`restore VMID --stream` supports both staged and streamed VMA archives, including older versions. It reads the verified manifest and checks the remote archive size before creating the VM; when the manifest includes MD5, that must match remote metadata too. Incoming compressed bytes are hashed, decompressed, and passed to `qmrestore` through pipes. SHA-256 and size must match before completion. No local archive is created. Native QCOW2 archives still require staged restoration to preserve internal snapshots. Destination storage must accommodate the restored disks; eliminating staging does not reduce that requirement.
+
+Streaming restore writes destination disks before the final SHA-256 result is available. The target is never automatically started. Successful restoration disables onboot; a final checksum mismatch leaves the target backup-locked. Other failures can leave partial disks or a Proxmox restore lock. Inspect `restore-state.json`, the logs, and the target VM before removing a failed target and retrying. The script does not overwrite an occupied VM ID or delete partial restore disks automatically. Cloud archives are retained.
+
+### Interrupted streams
+
+An interrupted upload has no resumable local archive. Check the VM and Proxmox task state before retrying; keep the source stopped. If a backup lock remains, unlock only after confirming the failed task has ended. Run `upload VMID --stream` again to start a new attempt. Incomplete cloud folders remain hidden from `list`; their exact destination is recorded in `attempt.json`. They are retained for inspection and can be removed manually once the attempt is confirmed incomplete. No automatic remote pruning is performed.
+
+If all stream processes completed but cloud verification or finalization failed, a `stream-complete.json` receipt enables recovery without retransmitting disk data:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  recover 100 --resume /var/lib/vz/pve-drive/stream-100-EXAMPLE
+```
+
+Use the exact printed directory, with the matching `--work-dir` if overridden. Recovery validates the receipt, source identity, unchanged stopped VM configuration, and cloud checksums. It uploads only the small manifest/marker as necessary and always retains the source VM. A receipt is required: recovery cannot certify a partial stream. Preserve the receipt until recovery finishes. Successful recovery removes local metadata unless `--keep-local` is supplied.
+
+See the upstream [vzdump documentation](https://pve.proxmox.com/pve-docs/vzdump.1.html) and [rclone rcat documentation](https://rclone.org/commands/rclone_rcat/) for streaming behavior. rcat cannot replay a failed stream; backend chunk retries remain available where supported.
+
 ## Supported archives and limitations
 
 | VM layout | Archive format |

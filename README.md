@@ -57,6 +57,14 @@ The example archives VM `100` to `gdrive:pve-archive` under source identifier `p
 
 **Without `--keep-vm`, a successful upload deletes the source VM and its disks after verification.**
 
+For VMs without snapshots, `--stream` uploads directly without creating a local archive:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --stream --keep-vm
+```
+
+Streaming requires a remote with streaming upload and MD5 support, such as Google Drive. Interrupted transfers restart from the beginning. Native QCOW2 snapshot archives require staging.
+
 ### List
 
 List the latest complete archive for each source VM, including archive size and snapshot names:
@@ -81,6 +89,15 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 ```
 
 Restoration rejects occupied VM IDs and leaves the restored VM stopped. Guest static IP addresses are unaffected by `--unique`. The cloud archive is retained.
+
+Use `--stream` to restore a VMA archive without downloading a staging copy:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  restore 100 --target-vmid 200 --storage destination-dir --unique --stream
+```
+
+Streaming restoration checks SHA-256 as data is restored. A failed operation may leave unverified destination disks; inspect the target before retrying. Destination storage still needs sufficient capacity for the restored disks.
 
 ## Operational notes
 
