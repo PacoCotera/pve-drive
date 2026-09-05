@@ -38,7 +38,7 @@ class NativeTests(unittest.TestCase):
         self.args = p.parser().parse_args([
             '--remote', 'gdrive:pve-archive', '--source', 'pve-site-a',
             '--work-dir', str(self.root / 'stage'), 'archive', '100',
-            '--format', 'native-qcow2', '--delete-vm', '--deep-verify'])
+            '--format', 'native-qcow2', '--single-file', '--delete-vm', '--deep-verify'])
         self.m = p.Manager(self.args)
         self.file('100').write_text(CONFIG)
         self.disk = self.root / 'source.qcow2'

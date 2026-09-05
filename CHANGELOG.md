@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0
+
+- Add versioned native QCOW2 multipart transport with 4 GiB parts, eight concurrent rclone transfers, and 128 MiB Google Drive upload chunks by default.
+- Preserve original disk bytes, internal snapshots, and Proxmox configuration; require part and whole-file checksums and verified publication before source deletion.
+- Resume interrupted multipart uploads, automatically retry Drive quota blocks, and reuse verified parts during download recovery.
+- Retain legacy archive restore support, logical VM listings, and guarded cleanup of incomplete attempts.
+- Add advanced tuning, archive format documentation, and a reproducible Hetzner-to-Drive benchmark procedure.
+
 ## 0.8.4
 
 - Add `cleanup VMID` to discover recorded upload attempts by source and VM ID. Preview by default; add `--apply` to remove them without looking up staging paths.

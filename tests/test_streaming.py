@@ -192,12 +192,11 @@ class StreamLifecycleTests(unittest.TestCase):
             with self.subTest(chunk=selected), patch.object(self, 'pipeline', side_effect=inspect), self.assertRaises(RuntimeError):
                 self.execute()
 
-    def test_drive_chunk_size_requires_stream_before_vm_changes(self):
-        self.a.stream = False
-        self.a.drive_chunk_size = '128M'
-        with self.assertRaisesRegex(ValueError, 'requires --stream'):
-            self.execute()
-        self.assertEqual(self.case.commands, [])
+    def test_drive_chunk_size_allowed_without_stream(self):
+        args = p.parser().parse_args(['--remote', 'gdrive:pve-archive', '--source', 'pve-site-a',
+                                      'upload', '100', '--drive-chunk-size', '128M'])
+        self.assertFalse(args.stream)
+        self.assertEqual(args.drive_chunk_size, '128M')
 
     def test_unsupported_remote_fails_before_shutdown(self):
         for features in [{'Features': {'PutStream': False}, 'Hashes': ['MD5']},

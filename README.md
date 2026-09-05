@@ -67,7 +67,9 @@ Streaming requires a remote with streaming upload and MD5 support, such as Googl
 
 Streaming upload progress shows an estimated maximum size and ETA based on configured disk capacities plus an overhead allowance. Compression can make the actual archive substantially smaller.
 
-For large Google Drive uploads, test `--stream --drive-chunk-size 128M`. The default is `32M`; larger chunks use more RAM and may improve throughput. The option does not change compression settings.
+Native QCOW2 archives automatically use parallel Google Drive transfers while preserving the exact disk bytes and supported internal snapshots. Defaults are 4 GiB parts, eight transfers, and 128 MiB upload chunks. Normal commands are unchanged; advanced tuning is available in `upload --help` and `restore --help`.
+
+Drive quota blocks are retried hourly up to 24 times. If interrupted, repeat the same upload command to resume one recorded unfinished multipart attempt. Keep its staging files and the source VM stopped and backup-locked. See [recovery and tuning](ADMIN.md), the [archive format](MULTIPART_FORMAT.md), and the [live benchmark procedure](BENCHMARK.md). Streaming VMA retains its existing 32 MiB default and restart behavior.
 
 ### List
 

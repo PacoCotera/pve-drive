@@ -24,7 +24,7 @@ The installer places the executable at `/usr/local/sbin/pve-drive`. It preserves
 
 ## Space and staging
 
-Default staging is `/var/lib/vz/pve-drive`. Check free space before starting. Native QCOW2 archives are uncompressed and can exceed the guest’s virtual disk capacity because of snapshots. Upload staging requires the full disk-file lengths plus 1 GiB. Restore requires space for a download and a destination copy: on one filesystem allow approximately twice the archive size plus headroom. Sparse savings are not assumed.
+Default staging is `/var/lib/vz/pve-drive`. Check free space before starting. Native QCOW2 archives are uncompressed and can exceed the guest’s virtual disk capacity because of snapshots. Upload staging requires the full disk-file lengths plus 1 GiB. Multipart restore staging requires twice the archive size plus 1 GiB for parts and reconstruction; destination storage needs another full disk copy. On one filesystem allow approximately three times the archive size plus headroom. Legacy native restore needs one staged copy and one destination copy. Sparse savings are not assumed.
 
 To stage a restore on a larger filesystem:
 
@@ -38,6 +38,31 @@ Use an existing mounted filesystem with adequate space. `--storage` chooses rest
 
 Successful `upload`, `restore`, and `recover` remove staging by default; `--keep-local` retains it. Failed operations preserve recovery data; empty staging directories are removed when the initial space check fails. Advanced `archive` and `verify` retain staging unless `--cleanup-local` is supplied.
 
+## Parallel native uploads and Drive quotas
+
+Native QCOW2 upload automatically splits each exact disk file into independent 4 GiB parts and sends eight files concurrently, using 128 MiB Drive upload chunks. There is no conversion, recompression, or snapshot flattening. VMA/native format selection is unchanged. Source deletion requires verified parts, manifest, completion marker, and an unchanged source. Older archives remain restorable. See [MULTIPART_FORMAT.md](MULTIPART_FORMAT.md) for schema 4 and [BENCHMARK.md](BENCHMARK.md) for the required live performance comparison; throughput improvement has not yet been measured on the actual Drive path.
+
+The normal interface remains:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100
+pve-drive --remote gdrive:pve-archive --source pve-site-a list
+pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
+```
+
+Advanced native upload options are `--part-size 4G`, `--transfers 8`, and `--drive-chunk-size 128M`. M/G/T are binary units. Part size accepts 1 MiB through 1 TiB; transfer count accepts 1-32. Eight 128 MiB upload buffers use roughly 1 GiB plus process overhead. Restore accepts `--transfers`; part sizes come from the manifest. `--single-file` selects schema 3 for comparison benchmarks. These options do not change an already staged manifest or compression settings.
+
+On recognized daily upload-limit errors, the default is to wait 3600 seconds and retry up to 24 times. Completed remote parts are checksum-matched and skipped. Use `--quota-retries 0` to exit resumably, or tune the retry count and `--quota-retry-delay SECONDS` (60-86400). The source stays stopped and backup-locked throughout waits. Ctrl-C is safe: retain staging and repeat the normal upload command after quota reset. One matching unfinished multipart attempt is selected automatically; multiple matches require `--resume STAGING_DIR` or explicit cleanup. Resume repeats source/configuration and local checksum checks before uploading. Quota waits can also occur during manifest or marker publication. Remote conflicts stop safely rather than overwriting existing objects. Google does not promise a reset at local midnight; see [Google upload limits](https://support.google.com/a/answer/7338880).
+
+For an interrupted multipart restore before VM creation:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  restore 100 --resume /var/lib/vz/pve-drive/native-download-EXAMPLE
+```
+
+Use the same selected backup, target options, remote, source, and work directory. Already downloaded parts are checked by SHA-256 and reused; incomplete or corrupted local parts are downloaded again. Reconstruction writes a temporary image and independently verifies its whole-file SHA-256 before any VM is created. After Proxmox allocation starts, inspect `restore-state.json` and the target instead of using this download-resume option.
+
 ## Streaming upload and restore
 
 `upload VMID --stream` sends a zstd-compressed VMA directly from `vzdump --stdout` to `rclone rcat`. The relay uses bounded buffers, calculates SHA-256 and MD5, and feeds the same compressed bytes to `zstd --test`. It requires successful exits from all processes and checks that vzdump included every configured data disk. Cloud size and MD5 verification, manifest verification, and completion-marker read-back must succeed before source VM deletion.
@@ -50,7 +75,7 @@ Streaming restore writes destination disks before the final SHA-256 result is av
 
 ### Interrupted streams
 
-For Google Drive, `upload VMID --stream --drive-chunk-size 128M` overrides the default 32 MiB upload chunks. Supported values are `8M`, `16M`, `32M`, `64M`, `128M`, and `256M`. Chunk buffers consume RAM; larger chunks may reduce request overhead but do not guarantee higher throughput. The option requires `--stream`, does not affect compression, and cannot change an active transfer. Compare sustained rates while keeping other settings unchanged.
+For Google Drive, `upload VMID --stream --drive-chunk-size 128M` overrides the default 32 MiB upload chunks. Supported values are `8M`, `16M`, `32M`, `64M`, `128M`, and `256M`. Chunk buffers consume RAM; larger chunks may reduce request overhead but do not guarantee higher throughput. The option also tunes native uploads (default 128M); it does not affect compression and cannot change an active transfer. Compare sustained rates while keeping other settings unchanged.
 
 Version 0.8.1 fixes an SSH-terminal startup failure in streaming upload (`failed to tcsetpgrp`, followed by zstd `unexpected end of file`). Update before retrying an affected attempt. This failure occurs before backup data is produced; it cannot be finalized with `recover`.
 
@@ -122,7 +147,7 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
   upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm
 ```
 
-Use the exact printed staging path. The original VM must remain stopped and backup-locked, with matching full configuration. This replaces failed local copies in the same staging directory and continues normal upload checks. It refuses stages that already contain a manifest or completion marker. Hash failures retain `copy-mismatch.json` with sizes, timestamps, and checksum diagnostics; they cannot be bypassed.
+Use the exact printed staging path. The original VM must remain stopped and backup-locked, with matching full configuration. This replaces failed local copies in the same staging directory and continues normal upload checks. Legacy stages with a manifest require `recover`; multipart stages with a manifest resume remote transfer and verification. Legacy local copy failures retain `copy-mismatch.json`; multipart failures retain the parts and diagnostic log. Checksum failures cannot be bypassed.
 
 ### Uploaded files, interrupted verification or finalization
 
@@ -131,13 +156,13 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
   recover 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE
 ```
 
-Run on the original source node with the original source label, complete local payload, and saved manifest. The VM must remain stopped and backup-locked. Recovery checks identity, configuration, local SHA-256, disk integrity, and cloud sizes/MD5. It computes SHA-256 and MD5 in one local read; it does not recopy, reupload, or download archive data. Only the completion marker is uploaded and read back.
+Run on the original source node with the original source label, complete local payload, and saved manifest. The VM must remain stopped and backup-locked. Recovery checks identity, configuration, local SHA-256, and cloud sizes/MD5. Legacy native recovery checks QCOW2 integrity; multipart recovery checks every part and their complete ordered SHA-256 against the original. It computes per-file SHA-256 and MD5 in one local read; it does not recopy, reupload, or download archive data. Only the completion marker is uploaded and read back.
 
 On success, the archive becomes available to `list`/`restore`, and the VM is retained, stopped, and unlocked. Recovery never deletes the VM. Staging is removed after successful recovery; `--keep-local` retains it. The older `--cleanup-local` option remains accepted. A matching existing cloud marker permits retry while the VM still holds its backup lock. Missing cloud files cannot be repaired by `recover`; they require a separate upload.
 
 ### Other failures
 
-Incomplete remote folders without `COMPLETE` are ignored by listing and automatic restore. Rclone retries transient errors within an operation; a fresh upload creates a new version. Neither recovery command provides general interrupted-download resumption.
+Incomplete remote folders without `COMPLETE` are ignored by listing and automatic restore. Rclone retries transient errors within an operation. Multipart uploads reuse a recorded unfinished attempt; other fresh uploads create a new version. Multipart downloads and reconstruction can resume with `restore ... --resume STAGING_DIR`, before VM creation.
 
 Interrupted native restores may leave a create-locked placeholder VM and allocated disks. Staging’s `restore-state.json` records allocations, including disks that may not yet be attached. Inspect before cleanup; do not simply unlock and start the placeholder. VMA restore failures can also leave partial VMs. The script does not automatically delete these allocations and will refuse to overwrite the VMID on retry.
 

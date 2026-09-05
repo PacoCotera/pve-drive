@@ -67,7 +67,7 @@ class ProgressTests(unittest.TestCase):
     def test_rclone_stats_and_warning(self):
         c, stream = self.display()
         c.stage('Uploading')
-        c.last = 0
+        c.last = float('-inf')  # Independent of host/WSL uptime.
         c.output(json.dumps({'stats': {'bytes': 512, 'totalBytes': 1024,
                                      'speed': 128, 'elapsedTime': 4}}), rclone=True)
         c.output('{"level":"warning","msg":"Retrying transfer"}', rclone=True)

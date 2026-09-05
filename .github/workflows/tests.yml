@@ -13,7 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run simulated lifecycle tests
+      - name: Install integration test tools
+        run: sudo apt-get update && sudo apt-get install -y qemu-utils zstd rclone
+      - name: Run lifecycle and real transport/snapshot tests
         run: python3 -m unittest discover -s tests -v
       - name: Check command help
         run: |

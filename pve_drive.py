@@ -18,7 +18,135 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.8.4'
+__version__ = '0.9.0'
+
+PART_SIZE = 4 * 1024 ** 3
+TRANSFERS = 8
+
+
+def part_size(value):
+    match = re.fullmatch(r'([1-9][0-9]*)([MGT])', value.upper())
+    if not match:
+        raise argparse.ArgumentTypeError('Use a positive binary size such as 4G or 512M')
+    size = int(match[1]) * 1024 ** ('MGT'.index(match[2]) + 2)
+    if not 1024 ** 2 <= size <= 1024 ** 4:
+        raise argparse.ArgumentTypeError('Part size must be between 1M and 1T')
+    return size
+
+
+def transfer_count(value):
+    count = int(value)
+    if not 1 <= count <= 32:
+        raise argparse.ArgumentTypeError('Transfers must be between 1 and 32')
+    return count
+
+
+def split_native(source, payload, filename, size):
+    """Copy exact bytes into independent parts; bounded memory, atomic part names."""
+    before = file_details(source)
+    if type(size) is not int or size <= 0 or before['size'] <= 0:
+        raise ValueError('Multipart source and part size must be nonempty/positive')
+    whole = hashlib.sha256()
+    parts = []
+    console.stage(f'Preparing native disk {filename}')
+    with Path(source).open('rb') as src:
+        remaining = before['size']
+        while remaining:
+            name = f'{filename}.part-{len(parts):06d}'
+            target = payload / name
+            temporary = payload / (name + '.partial')
+            if target.is_symlink() or temporary.is_symlink():
+                raise ValueError('Refusing symlink in multipart payload')
+            length = min(size, remaining)
+            digest = hashlib.sha256()
+            with temporary.open('wb') as out:
+                left = length
+                while left:
+                    block = src.read(min(left, 8 * 1024 ** 2))
+                    if not block:
+                        raise ValueError('Source truncated while splitting')
+                    out.write(block)
+                    digest.update(block)
+                    whole.update(block)
+                    left -= len(block)
+                    console.update(before['size'] - remaining + length - left, before['size'])
+                out.flush()
+                os.fsync(out.fileno())
+            temporary.replace(target)
+            parts.append({'filename': name, 'size': length, 'sha256': digest.hexdigest()})
+            remaining -= length
+        if src.read(1) or file_details(source) != before:
+            raise ValueError('Source changed while splitting')
+    record = {'filename': filename, 'size': before['size'], 'sha256': whole.hexdigest(),
+              'part_size': size, 'parts': parts}
+    # Read staging back, including the whole-file digest, before any upload.
+    check_parts(payload, record)
+    if sha256(source) != record['sha256'] or file_details(source) != before:
+        raise ValueError('Source changed while splitting')
+    return record
+
+
+def atomic_json(path, value):
+    temporary = path.with_name(path.name + '.tmp')
+    if path.is_symlink() or temporary.is_symlink():
+        raise ValueError('Refusing symlink metadata file')
+    with temporary.open('w', encoding='utf-8', newline='\n') as out:
+        json.dump(value, out, indent=2)
+        out.write('\n')
+        out.flush()
+        os.fsync(out.fileno())
+    temporary.replace(path)
+
+
+def check_parts(directory, disk, target=None, collect_md5=False):
+    """Verify ordered parts and whole bytes, optionally atomically reconstruct."""
+    whole = hashlib.sha256()
+    total = 0
+    checks = {}
+    console.stage('Reconstructing native disk' if target is not None else 'Verifying native archive')
+    with ExitStack() as stack:
+        out = None
+        if target is not None:
+            temporary = target.with_name(target.name + '.partial')
+            if target.is_symlink() or temporary.is_symlink():
+                raise ValueError('Refusing symlink reconstruction target')
+            out = stack.enter_context(temporary.open('wb'))
+        for part in disk['parts']:
+            path = directory / part['filename']
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != part['size']:
+                raise ValueError(f'Missing part or part size mismatch: {part["filename"]}')
+            digest = hashlib.sha256()
+            md5 = hashlib.md5(usedforsecurity=False) if collect_md5 else None
+            length = 0
+            with path.open('rb') as src:
+                while True:
+                    block = src.read(8 * 1024 ** 2)
+                    if not block:
+                        break
+                    digest.update(block)
+                    if md5 is not None:
+                        md5.update(block)
+                    whole.update(block)
+                    length += len(block)
+                    console.update(total + length, disk['size'])
+                    if out:
+                        out.write(block)
+            if length != part['size'] or digest.hexdigest() != part['sha256']:
+                raise ValueError(f'Part checksum mismatch: {part["filename"]}')
+            if md5 is not None:
+                checks[part['filename']] = (length, md5.hexdigest())
+            total += length
+        if total != disk['size'] or whole.hexdigest() != disk['sha256']:
+            raise ValueError('Whole-file checksum/size mismatch')
+        if out:
+            out.flush()
+            os.fsync(out.fileno())
+    if target is not None:
+        # Check the actual file on disk, not only the input stream.
+        if temporary.stat().st_size != disk['size'] or sha256(temporary) != disk['sha256']:
+            raise ValueError('Reconstructed whole-file checksum mismatch')
+        temporary.replace(target)
+    return checks
 
 
 def duration(seconds):
@@ -677,7 +805,10 @@ class Manager:
 
     def verify_upload(self, payload, destination, local_checks=None, completion_hash=None):
         if getattr(self.a, 'deep_verify', False):
-            self.rc('check', payload, destination, '--download')
+            # A retried publication may already have its marker. Its exact
+            # contents are checked separately; it is not part of the payload.
+            self.rc('check', payload, destination, '--download',
+                    *(['--one-way'] if completion_hash is not None else []))
             return
         # Require MD5 explicitly: plain rclone check can fall back to size only
         # when a remote does not expose a compatible checksum.
@@ -904,9 +1035,24 @@ class Manager:
         console.note('Attempt cleanup complete')
 
     def archive(self):
-        if getattr(self.a, 'drive_chunk_size', None) is not None and not getattr(self.a, 'stream', False):
-            raise ValueError('--drive-chunk-size requires --stream')
         ident = vmid(self.a.vmid)
+        if not getattr(self.a, 'resume', None) and not getattr(self.a, 'stream', False):
+            attempts = []
+            for stage in sorted(self.work.glob(f'native-{ident}-*')):
+                path = stage / 'payload' / 'manifest.json'
+                if stage.is_symlink() or not path.is_file() or path.is_symlink():
+                    continue
+                m = json.loads(path.read_text())
+                if (m.get('schema') == 4 and m.get('source') == self.a.source
+                        and not (stage / 'UPLOAD_DONE').exists()):
+                    record = stage / 'attempt.json'
+                    if record.is_file() and json.loads(record.read_text()).get('destination') == self.base + '/' + m.get('backup_id', ''):
+                        attempts.append(stage)
+            if len(attempts) > 1:
+                raise ValueError('Multiple unfinished uploads; select one with --resume STAGING_DIR or cleanup VMID')
+            if attempts:
+                self.a.resume = str(attempts[0])
+                console.note(f'Resuming unfinished upload: {attempts[0]}')
         if not self.a.delete_vm and not self.a.keep_vm:
             raise ValueError('Choose --delete-vm or --keep-vm')
         cfg = self.config(ident)
@@ -1135,12 +1281,12 @@ class Manager:
         return destination, m
 
     def validate_manifest(self, m, bid):
-        expected_schemas = (2, 3) if self.a.source else (1,)
+        expected_schemas = (2, 3, 4) if self.a.source else (1,)
         if m.get('schema') not in expected_schemas or m.get('backup_id') != bid or str(m.get('vmid')) != bid.split('/')[0]:
             raise ValueError('Invalid manifest identity/schema')
         if self.a.source and m.get('source') != self.a.source:
             raise ValueError('Manifest source does not match selected source')
-        if m['schema'] == 3:
+        if m['schema'] in (3, 4):
             self.validate_native_manifest(m)
             return
         if not re.fullmatch(r'vzdump-qemu-[0-9]+-[A-Za-z0-9_-]+\.vma\.zst', m.get('filename', '')):
@@ -1176,13 +1322,16 @@ class Manager:
         expected = dict(m['config'], lock='backup')
         self.unchanged(ident, expected.copy())
         native_raw = None
-        if m['schema'] == 3:
+        if m['schema'] in (3, 4):
             native_raw = (payload / 'vm.conf').read_text()
             sections = parse_native_config(native_raw)
             if (native_volumes(sections, ident) != {d['device']: d['volume'] for d in m['disks']} or
                     set(sections) - {'current'} != set(m['snapshots'])):
                 raise ValueError('Recovery manifest/configuration mismatch')
             files = {d['filename']: (d['size'], d['sha256']) for d in m['disks']}
+            if m['schema'] == 4:
+                files = {part['filename']: (part['size'], part['sha256'])
+                         for d in m['disks'] for part in d['parts']}
             files['vm.conf'] = (None, m['config_sha256'])
         else:
             files = {m['filename']: (m['size'], m['sha256'])}
@@ -1215,8 +1364,11 @@ class Manager:
                 if sha != hashlib.sha256(manifest_bytes).hexdigest():
                     raise ValueError('Recovery manifest changed during validation')
             local_checks[name] = (states[name]['size'], md5)
-        if m['schema'] == 3:
+        if m['schema'] in (3, 4):
             for d in m['disks']:
+                if m['schema'] == 4:
+                    check_parts(payload, d)
+                    continue
                 if self.qcow_info(payload / d['filename'], m['snapshots'])['virtual-size'] != d['virtual_size']:
                     raise ValueError('Recovery disk virtual size mismatch')
         else:
@@ -1232,12 +1384,16 @@ class Manager:
             raise ValueError('Completion marker verification failed')
         check_vm()
         run('qm', 'unlock', ident)
+        if m['schema'] == 4:
+            (stage / 'UPLOAD_DONE').write_text(m['backup_id'] + '\n')
         self.finish_staging(stage)
         console.note(f'Recovery complete: VM {ident} retained, stopped and unlocked; cloud archive ready to restore')
 
     def download(self):
         destination, m = self.manifest(self.a.backup_id)
-        if m.get('schema') == 3:
+        if getattr(self.a, 'resume', None) and m.get('schema') != 4:
+            raise ValueError('Download resume requires a multipart native archive')
+        if m.get('schema') in (3, 4):
             return self.download_native(destination, m)
         report_media(m.get('external_media', {}))
         report_pci(m.get('config', {}))
@@ -1276,8 +1432,10 @@ class Manager:
         console.note(f'Restored VM {ident}, stopped with onboot disabled. Cloud archive retained.')
 
     def restore_stream(self, ident):
+        if getattr(self.a, 'resume', None):
+            raise ValueError('--stream cannot be combined with --resume')
         destination, manifest = self.manifest(self.a.backup_id)
-        if manifest.get('schema') == 3:
+        if manifest.get('schema') in (3, 4):
             raise ValueError('--stream restore supports VMA archives only; native QCOW2 needs staged restore')
         report_media(manifest.get('external_media', {}))
         report_pci(manifest.get('config', {}))
@@ -1384,7 +1542,7 @@ class Manager:
         # when validation of the newest complete archive fails.
         self.a.backup_id = max(candidates)
         _, manifest = self.manifest(self.a.backup_id)
-        if manifest.get('schema') == 3 and not self.a.storage:
+        if manifest.get('schema') in (3, 4) and not self.a.storage:
             storages = {d['volume'].split(':')[0] for d in manifest['disks']}
             if len(storages) != 1:
                 raise ValueError('Archive uses multiple storages; specify --storage for this restore')
@@ -1421,8 +1579,10 @@ class Manager:
             payload = stage / 'payload'
             if not payload.is_dir() or payload.is_symlink() or (payload / 'vm.conf').is_symlink():
                 raise ValueError('Invalid native staging directory')
-            if (payload / 'manifest.json').exists() or (stage / 'COMPLETE').exists():
-                raise ValueError('Resume is only supported before manifest creation/upload')
+            if (payload / 'manifest.json').exists():
+                return self.resume_multipart(ident, stage, cfg)
+            if (stage / 'COMPLETE').exists():
+                raise ValueError('Unexpected completion marker without manifest')
             raw = (payload / 'vm.conf').read_text()
             self.stopped(ident)
             locked_raw = self.config_file(ident).read_text()
@@ -1468,28 +1628,55 @@ class Manager:
         if not resume:
             payload.mkdir()
             (payload / 'vm.conf').write_bytes(raw.encode('utf-8'))
+        multipart = not getattr(self.a, 'single_file', False)
         allowed = {'vm.conf'} | {key + '.qcow2' for key in sources}
+        if multipart:
+            allowed |= {p.name for p in payload.iterdir() if any(
+                re.fullmatch(re.escape(key + '.qcow2') + r'\.part-[0-9]{6}(?:\.partial)?', p.name)
+                for key in sources)}
         if any(p.name not in allowed or p.is_symlink() or not p.is_file() for p in payload.iterdir()):
             raise ValueError('Unexpected files in native payload')
         records = []
         for key, path in sources.items():
             info = self.qcow_info(path, snapshots)
             dest = payload / (key + '.qcow2')
-            source_hash = verified_native_copy(path, dest, stage / 'copy-mismatch.json')
-            self.qcow_info(dest, snapshots)
-            records.append({'filename': dest.name, 'volume': volumes[key], 'device': key,
-                            'virtual_size': info['virtual-size'], 'size': dest.stat().st_size,
-                            'sha256': source_hash})
+            if multipart:
+                record = split_native(path, payload, dest.name, getattr(self.a, 'part_size', PART_SIZE))
+                record['original_filename'] = path.name
+                expected_parts = {part['filename'] for part in record['parts']}
+                for previous in payload.glob(dest.name + '.part-*'):
+                    if previous.name not in expected_parts:
+                        previous.unlink()
+                # Old local-copy attempts can be resumed into the new transport.
+                if dest.exists():
+                    dest.unlink()
+                self.qcow_info(path, snapshots)
+            else:
+                source_hash = verified_native_copy(path, dest, stage / 'copy-mismatch.json')
+                self.qcow_info(dest, snapshots)
+                record = {'filename': dest.name, 'size': dest.stat().st_size, 'sha256': source_hash}
+            record.update(volume=volumes[key], device=key, virtual_size=info['virtual-size'])
+            records.append(record)
         bid = f"{ident}/{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}"
-        m = {'schema': 3, 'format': 'native-qcow2', 'backup_id': bid, 'vmid': int(ident),
+        m = {'schema': 4 if multipart else 3, 'format': 'native-qcow2', 'backup_id': bid, 'vmid': int(ident),
              'source': self.a.source, 'source_node': Path('/etc/pve/local').resolve().name,
              'created_utc': datetime.now(timezone.utc).isoformat(), 'config': cfg,
              'snapshots': snapshots, 'disks': records,
              'config_sha256': sha256(payload / 'vm.conf'),
              'size': sum(x['size'] for x in records) + (payload / 'vm.conf').stat().st_size}
-        (payload / 'manifest.json').write_bytes((json.dumps(m, indent=2) + '\n').encode('utf-8'))
+        if multipart:
+            m['transport'] = {'format': 'pve-drive-parts', 'version': 1}
+        self.validate_manifest(m, bid)
+        if multipart:
+            atomic_json(stage / 'attempt.json', {'backup_id': bid, 'destination': self.base + '/' + bid})
+        # Temporary metadata lives outside the transferable payload.
+        atomic_json(stage / 'manifest.json', m)
+        (stage / 'manifest.json').replace(payload / 'manifest.json')
+        if multipart:
+            return self.finish_multipart(ident, stage, m, locked_raw, sources)
         destination = self.base + '/' + bid
-        self.rc('copy', payload, destination, '--immutable')
+        self.rc('copy', payload, destination, '--immutable', '--transfers', getattr(self.a, 'transfers', TRANSFERS),
+                '--drive-chunk-size', getattr(self.a, 'drive_chunk_size', None) or '128M')
         self.verify_upload(payload, destination)
         marker = stage / 'COMPLETE'
         marker.write_bytes((sha256(payload / 'manifest.json') + '\n').encode('ascii'))
@@ -1513,6 +1700,118 @@ class Manager:
         self.finish_staging(stage)
         console.note('Native archive complete; ' + ('VM deleted.' if self.a.delete_vm else 'VM retained, stopped.'))
 
+    def multipart_files(self, m):
+        return {'vm.conf', 'manifest.json'} | {
+            part['filename'] for d in m['disks'] for part in d['parts']}
+
+    def quota_retry(self, operation):
+        retries = getattr(self.a, 'quota_retries', 24)
+        for attempt in range(retries + 1):
+            try:
+                return operation()
+            except RuntimeError as error:
+                if not re.search(r'upload limit|uploadLimitExceeded|userRateLimitExceeded|dailyLimitExceeded|User rate limit exceeded', str(error), re.I):
+                    raise
+                if attempt == retries:
+                    raise RuntimeError('Drive upload quota still blocked; staging and VM retained. '
+                                       'Repeat the same upload command after quota resets.') from error
+                delay = getattr(self.a, 'quota_retry_delay', 3600)
+                console.note(f'Drive upload quota blocked; retrying in {delay}s '
+                             f'({attempt + 1}/{retries}). Completed parts are retained. '
+                             'Ctrl-C safely leaves the attempt resumable.')
+                time.sleep(delay)
+
+    def resume_multipart(self, ident, stage, cfg):
+        payload = stage / 'payload'
+        m = json.loads((payload / 'manifest.json').read_text())
+        self.validate_manifest(m, backup_id(m.get('backup_id', '')))
+        if m['schema'] != 4:
+            raise ValueError('Resume is only supported before manifest creation/upload for legacy archives; use recover')
+        if (str(m['vmid']) != ident or m.get('source_node') != Path('/etc/pve/local').resolve().name
+                or {k: v for k, v in m['config'].items() if k != 'digest'} != {k: v for k, v in cfg.items() if k != 'digest'}):
+            raise ValueError('Resume VM/node/configuration mismatch')
+        record = stage / 'attempt.json'
+        if record.is_symlink() or (record.exists() and json.loads(record.read_text()).get('destination') != self.base + '/' + m['backup_id']):
+            raise ValueError('Resume remote/source mismatch')
+        raw = self.config_file(ident).read_text()
+        if re.sub(r'^lock: backup\n', '', raw, flags=re.M) != (payload / 'vm.conf').read_text():
+            raise ValueError('VM snapshot configuration differs from staged archive')
+        sources = {d['device']: Path(run('pvesm', 'path', d['volume'], capture=True).strip()).resolve()
+                   for d in m['disks']}
+        return self.finish_multipart(ident, stage, m, raw, sources)
+
+    def finish_multipart(self, ident, stage, m, locked_raw, sources):
+        payload = stage / 'payload'
+        if {p.name for p in payload.iterdir()} != self.multipart_files(m):
+            raise ValueError('Unexpected or missing multipart payload files')
+        if any(p.is_symlink() or not p.is_file() for p in payload.iterdir()):
+            raise ValueError('Multipart payload must contain only regular files')
+        if sha256(payload / 'vm.conf') != m['config_sha256']:
+            raise ValueError('Native configuration checksum mismatch')
+        sections = parse_native_config((payload / 'vm.conf').read_text())
+        if (native_volumes(sections, ident) != {d['device']: d['volume'] for d in m['disks']}
+                or set(sections) - {'current'} != set(m['snapshots'])):
+            raise ValueError('Native manifest/configuration mismatch')
+        # MD5 must come from the SAME bytes whose SHA-256 is validated, not
+        # from a later local read that could silently bless changed data.
+        states = {p.name: file_details(p) for p in payload.iterdir()}
+        local_checks = {}
+        for d in m['disks']:
+            local_checks.update(check_parts(payload, d, collect_md5=True))
+        expected = dict(m['config'], lock='backup')
+        def source_check():
+            self.unchanged(ident, expected.copy())
+            if self.config_file(ident).read_text() != locked_raw:
+                raise ValueError('Snapshot configuration changed; refusing deletion')
+            for d in m['disks']:
+                if sha256(sources[d['device']]) != d['sha256']:
+                    raise ValueError('Original disk changed after archive; refusing deletion')
+        source_check()
+        manifest_path = payload / 'manifest.json'
+        manifest_hash, manifest_md5 = file_hash(manifest_path, 'both')
+        config_hash, config_md5 = file_hash(payload / 'vm.conf', 'both')
+        if config_hash != m['config_sha256'] or json.loads(manifest_path.read_text()) != m:
+            raise ValueError('Multipart metadata changed during validation')
+        local_checks['manifest.json'] = (states['manifest.json']['size'], manifest_md5)
+        local_checks['vm.conf'] = (states['vm.conf']['size'], config_md5)
+        destination = self.base + '/' + m['backup_id']
+        # One rclone scheduler transfers independent files concurrently. Checksum
+        # matching skips completed parts on retries; immutable refuses conflicts.
+        self.quota_retry(lambda: self.rc('copy', payload, destination, '--immutable', '--checksum',
+                         '--exclude', '/manifest.json', '--transfers', getattr(self.a, 'transfers', TRANSFERS),
+                         '--drive-chunk-size', getattr(self.a, 'drive_chunk_size', None) or '128M',
+                         '--drive-stop-on-upload-limit'))
+        self.quota_retry(lambda: self.rc('copyto', manifest_path, destination + '/manifest.json',
+                                        '--immutable', '--checksum', '--drive-stop-on-upload-limit'))
+        self.verify_upload(payload, destination, local_checks=local_checks, completion_hash=manifest_hash)
+        if getattr(self.a, 'deep_verify', False):
+            # Deep verification reads local files again; bind those bytes back
+            # to the manifest as well before publishing.
+            for d in m['disks']:
+                check_parts(payload, d)
+        if self.rc('cat', destination + '/manifest.json', capture=True).encode() != manifest_path.read_bytes():
+            raise ValueError('Cloud manifest read-back mismatch')
+        source_check()
+        if any(file_details(payload / name) != state for name, state in states.items()) or sha256(manifest_path) != manifest_hash:
+            raise ValueError('Multipart payload changed during upload')
+        marker = stage / 'COMPLETE'
+        marker.write_bytes((manifest_hash + '\n').encode('ascii'))
+        self.quota_retry(lambda: self.rc('copyto', marker, destination + '/COMPLETE', '--immutable',
+                                        '--checksum', '--drive-stop-on-upload-limit'))
+        if self.rc('cat', destination + '/COMPLETE', capture=True) != marker.read_text():
+            raise ValueError('Completion marker verification failed')
+        # A quota wait can span hours, even when publishing the marker.
+        source_check()
+        if self.a.delete_vm:
+            run('qm', 'destroy', ident, '--skiplock', '1', '--purge', '1')
+            if any(str(x.get('vmid')) == ident for x in self.api('/cluster/resources')):
+                raise ValueError('VM still appears in cluster; local copy retained')
+        else:
+            run('qm', 'unlock', ident)
+        (stage / 'UPLOAD_DONE').write_text(m['backup_id'] + '\n')
+        self.finish_staging(stage)
+        console.note('Native archive complete; ' + ('VM deleted.' if self.a.delete_vm else 'VM retained, stopped.'))
+
     def validate_native_manifest(self, m):
         if m.get('format') != 'native-qcow2' or not isinstance(m.get('disks'), list) or not m['disks']:
             raise ValueError('Invalid native manifest')
@@ -1533,13 +1832,52 @@ class Manager:
             if d['filename'] in names or d['device'] in devices or d.get('volume') in volumes:
                 raise ValueError('Duplicate native disk')
             names.add(d['filename']); devices.add(d['device']); volumes.add(d.get('volume'))
+            if m['schema'] == 4:
+                original = d.get('original_filename')
+                if not isinstance(original, str) or not original or '/' in original or '\\' in original or original in ('.', '..'):
+                    raise ValueError('Invalid original disk filename')
+                if m.get('transport') != {'format': 'pve-drive-parts', 'version': 1}:
+                    raise ValueError('Unsupported multipart transport/version')
+                size = d.get('part_size')
+                parts = d.get('parts')
+                if type(size) is not int or size <= 0 or not isinstance(parts, list) or not parts:
+                    raise ValueError('Invalid multipart size/list')
+                if len(parts) != (d['size'] + size - 1) // size:
+                    raise ValueError('Missing or extra multipart part')
+                for index, part in enumerate(parts):
+                    if (not isinstance(part, dict) or part.get('filename') != f'{d["filename"]}.part-{index:06d}'
+                            or type(part.get('size')) is not int
+                            or part['size'] != min(size, d['size'] - index * size)
+                            or not re.fullmatch(r'[a-f0-9]{64}', part.get('sha256', ''))):
+                        raise ValueError('Invalid multipart ordering, name, size or checksum')
         if type(m.get('size')) is not int or m['size'] < sum(d['size'] for d in m['disks']):
             raise ValueError('Invalid total native size')
 
     def download_native(self, destination, m):
-        stage = self.stage('native-download-')
-        self.require_staging_space(stage, m['size'] + 1024 ** 3,
+        resume = getattr(self.a, 'resume', None)
+        if resume:
+            requested = Path(resume)
+            stage = requested.resolve()
+            if (requested.is_symlink() or stage.parent != self.work or not stage.name.startswith('native-download-')
+                    or not stage.is_dir() or m['schema'] != 4):
+                raise ValueError('Restore resume requires a multipart native-download staging directory under --work-dir')
+            receipt = stage / 'download.json'
+            if receipt.is_symlink() or json.loads(receipt.read_text()) != {'destination': destination, 'manifest': m}:
+                raise ValueError('Restore resume archive mismatch')
+            if (stage / 'restore-state.json').exists():
+                raise ValueError('VM restoration already started; inspect retained restore-state.json before recovery')
+            if any(p.is_symlink() for p in stage.rglob('*')):
+                raise ValueError('Restore resume refuses symlinks')
+        else:
+            stage = self.stage('native-download-')
+        # Parts are retained through reconstruction so an interrupted restore can
+        # reuse them. Allow for both complete representations, less existing data.
+        needed = m['size'] * (2 if m['schema'] == 4 else 1)
+        existing = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file()) if resume else 0
+        self.require_staging_space(stage, max(0, needed - existing) + 1024 ** 3,
                                    'Insufficient staging space for native disk files')
+        if m['schema'] == 4:
+            atomic_json(stage / 'download.json', {'destination': destination, 'manifest': m})
         self.rc('copyto', destination + '/vm.conf', stage / 'vm.conf')
         if sha256(stage / 'vm.conf') != m['config_sha256']:
             raise ValueError('Native configuration checksum mismatch')
@@ -1550,9 +1888,35 @@ class Manager:
         volumes = native_volumes(sections, str(m['vmid']))
         if volumes != {d['device']: d['volume'] for d in m['disks']} or set(sections) - {'current'} != set(m['snapshots']):
             raise ValueError('Native manifest/configuration mismatch')
+        if m['schema'] == 4:
+            parts_dir = stage / 'parts'
+            parts_dir.mkdir(exist_ok=True)
+            # Only manifest-listed files are downloaded. SHA-256 determines which
+            # local parts can be reused; never trust length or mtime alone.
+            missing = []
+            for d in m['disks']:
+                for part in d['parts']:
+                    path = parts_dir / part['filename']
+                    if (not path.is_file() or path.stat().st_size != part['size']
+                            or sha256(path) != part['sha256']):
+                        missing.append(part['filename'])
+            if missing:
+                selection = stage / 'download-files.txt'
+                selection.write_text('\n'.join(missing) + '\n')
+                self.rc('copy', destination, parts_dir, '--files-from-raw', selection,
+                        '--ignore-times', '--transfers', getattr(self.a, 'transfers', TRANSFERS),
+                        '--multi-thread-streams', '0')
         for d in m['disks']:
             target = stage / d['filename']
-            self.rc('copyto', destination + '/' + d['filename'], target)
+            if m['schema'] == 4:
+                if target.is_file() and target.stat().st_size == d['size'] and sha256(target) == d['sha256']:
+                    check_parts(parts_dir, d)
+                else:
+                    if target.exists():
+                        target.unlink()
+                    check_parts(parts_dir, d, target)
+            else:
+                self.rc('copyto', destination + '/' + d['filename'], target)
             if target.stat().st_size != d['size'] or sha256(target) != d['sha256']:
                 raise ValueError('Native disk checksum mismatch')
             info = self.qcow_info(target, m['snapshots'])
@@ -1665,16 +2029,16 @@ def parser():
                     'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history. '
                     'Direct GPU/HD-audio passthrough is supported; host hardware is not archived. '
                     '--stream avoids a local archive for VMs without snapshots.',
-        epilog='Resume is only for a failed native LOCAL COPY before a manifest was created. '
+        epilog='Multipart uploads resume completed parts after interruption or quota exhaustion. '
                'Use the exact printed staging path, keep the VM stopped and backup-locked, and do not unlock first. '
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
     to.add_argument('--stream', action='store_true', help='Stream VMA directly to cloud without a local archive; requires no snapshots and remote streaming/MD5 support. Progress uses an estimated maximum size/ETA; interrupted streams restart from the beginning')
     to.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'],
-                    help='Google Drive upload chunk size with --stream (default: 32M). Larger chunks use more RAM; try 128M for large archives')
+                    help='Drive upload chunk size (native multipart default: 128M; streaming: 32M); buffered per transfer')
     to.add_argument('--deep-verify', action='store_true', help='Verify upload by downloading it again (default: require matching cloud sizes and MD5 hashes)')
-    to.add_argument('--resume', metavar='STAGING_DIR', help='Retry a failed native local copy in its existing staging directory')
+    to.add_argument('--resume', metavar='STAGING_DIR', help='Resume an interrupted native copy or multipart upload; one recorded unfinished multipart upload is selected automatically')
     to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain staging after success (default: remove it); failures retain files')
     to.add_argument('--shutdown-timeout', type=int, default=300, help='Graceful shutdown timeout in seconds (default: %(default)s); no forced stop')
     fr = sub.add_parser('move-from-cloud', help='Restore latest complete archive to its original VMID')
@@ -1723,7 +2087,26 @@ def parser():
                                    'No VM is created or deleted. Downloaded files are retained unless --cleanup-local is used.')
     v.add_argument('backup_id', type=backup_id)
     v.add_argument('--cleanup-local', action='store_true')
+    for command in (to, a):
+        command.add_argument('--part-size', type=part_size, default=PART_SIZE, metavar='SIZE',
+                             help='Advanced: native archive part size, binary M/G/T (default: 4G)')
+        command.add_argument('--transfers', type=transfer_count, default=TRANSFERS,
+                             help='Advanced: concurrent native file transfers (default: 8)')
+        command.add_argument('--single-file', action='store_true',
+                             help='Advanced: legacy native transport for comparison benchmarks')
+        command.add_argument('--quota-retries', type=int, choices=range(0, 169), default=24, metavar='N',
+                             help='Advanced: retry Drive upload quota errors N times (default: 24; 0 exits resumably)')
+        command.add_argument('--quota-retry-delay', type=int, choices=range(60, 86401), default=3600, metavar='SECONDS',
+                             help='Advanced: delay between quota retries (default: 3600 seconds)')
+    a.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'],
+                   help='Drive upload chunk size (native multipart default: 128M)')
+    for command in (r, fr, v):
+        command.add_argument('--transfers', type=transfer_count, default=TRANSFERS,
+                             help='Advanced: concurrent multipart downloads (default: 8)')
+        command.add_argument('--resume', metavar='STAGING_DIR',
+                             help='Reuse verified parts from an interrupted multipart download/reconstruction')
     return p
+
 
 
 def main():
