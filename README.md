@@ -125,6 +125,8 @@ Snapshots are not included in the default vzdump archive. Their names are record
 
 ## Failures and recovery
 
+If native local copy verification fails, do not remove the source disk or bypass verification. Version 0.4.1 records source/destination sizes, timestamps, and SHA-256 values in `copy-mismatch.json` inside that operation's staging directory. It distinguishes a changing source from a copy that differs from a stable source. This adds diagnostic evidence; it does not claim to fix an unexplained host copy mismatch. The original VM and staging files remain, and no upload or VM deletion is attempted at this failure point. Inspect both files before unlocking or retrying.
+
 Console output names the staging directory and prints the verified backup ID before deletion. Save console output if running unattended. Failed uploads may leave directories without `COMPLETE`; `list` ignores these. Re-running archive creates a new backup rather than trusting a previous interrupted operation. Rclone retries transient transfer errors within an operation.
 
 After failure, first verify no backup/upload process is still active and inspect `qm status VMID`, `qm config VMID`, and the printed local files. If this tool reached the upload phase, it intentionally leaves `lock: backup` to prevent unintentional starts. Once the failed task and files have been inspected, run `qm unlock VMID` manually before retrying or starting the VM. Never unlock an active task. A killed process can also leave the lock; automatic unlocking would be unsafe.
