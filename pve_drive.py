@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.4.2'
+__version__ = '0.4.3'
 
 def run(*args, capture=False):
     print('+ ' + ' '.join(map(str, args)), file=sys.stderr, flush=True)
@@ -700,7 +700,20 @@ class Manager:
 
 
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(prog='pve-drive',
+        description='Move Proxmox QEMU VMs to/from cloud storage using rclone. '
+                    'Upload deletes the VM only after verification; use --keep-vm to test.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Examples (global options go BEFORE the command):\n'
+               '  pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm\n'
+               '  pve-drive --remote gdrive:pve-archive --source pve-site-a list\n'
+               '  pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100\n'
+               '  pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100 --target-vmid 200 --storage destination-dir --unique\n\n'
+               'Use the ORIGINAL source label when restoring on another PVE node.\n'
+               'Upload selects snapshot-preserving native QCOW2 mode when needed; unsupported layouts fail.\n'
+               'Restore selects the latest complete archive, refuses occupied VMIDs, and leaves the VM stopped.\n'
+               'Update after active tasks finish: cd /opt/pve-drive && git pull --ff-only && sudo ./install.sh\n'
+               'More help: pve-drive upload --help | pve-drive restore --help | ADMIN.md')
     p.add_argument('--version', action='version', version=__version__)
     p.add_argument('--remote', required=True, help='Configured rclone remote:dedicated-folder')
     sources = p.add_mutually_exclusive_group(required=True)
@@ -708,22 +721,27 @@ def parser():
                          help='Unique source server label; select original source for restore/list/verify')
     sources.add_argument('--legacy-layout', action='store_true',
                          help='Read backups created before source folders were introduced')
-    p.add_argument('--rclone-config', default='/root/.config/rclone/rclone.conf')
-    p.add_argument('--work-dir', default='/var/lib/vz/pve-drive')
+    p.add_argument('--rclone-config', default='/root/.config/rclone/rclone.conf', help='rclone configuration (default: %(default)s)')
+    p.add_argument('--work-dir', default='/var/lib/vz/pve-drive', help='Local staging directory (default: %(default)s)')
     sub = p.add_subparsers(dest='command', required=True)
-    to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM and its supported snapshot history, verify, then delete VM')
+    to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM, verify, then delete VM',
+        description='Shut down the source VM, select the archive format automatically, upload and verify, then delete it. '
+                    'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history.',
+        epilog='Resume is only for a failed native LOCAL COPY before a manifest was created. '
+               'Use the exact printed staging path, keep the VM stopped and backup-locked, and do not unlock first. '
+               'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
     to.add_argument('--resume', metavar='STAGING_DIR', help='Retry a failed native local copy in its existing staging directory')
-    to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True)
-    to.add_argument('--shutdown-timeout', type=int, default=300)
+    to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain staging after success (default: remove it); failures retain files')
+    to.add_argument('--shutdown-timeout', type=int, default=300, help='Graceful shutdown timeout in seconds (default: %(default)s); no forced stop')
     fr = sub.add_parser('move-from-cloud', help='Restore latest complete archive to its original VMID')
     fr.add_argument('vmid', type=vmid)
     fr.add_argument('--target-vmid', type=vmid, help='Restore under another VMID')
     fr.add_argument('--storage', help='Override original storage on destination server')
     fr.add_argument('--unique', action='store_true', help='Generate new MAC addresses')
     fr.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True)
-    a = sub.add_parser('archive', help='Shutdown, backup, upload, verify, optionally delete VM')
+    a = sub.add_parser('archive', help='Advanced: select archive format and deletion policy explicitly')
     a.add_argument('vmid', type=vmid)
     g = a.add_mutually_exclusive_group(required=True)
     g.add_argument('--delete-vm', action='store_true')
@@ -734,17 +752,28 @@ def parser():
     a.add_argument('--allow-snapshot-loss', action='store_true',
                    help='Permit VM deletion even though its snapshot history is not archived')
     a.add_argument('--cleanup-local', action='store_true')
-    r = sub.add_parser('restore')
+    r = sub.add_parser('restore', help='Restore latest complete backup by source VMID',
+        description='Select the latest complete backup for --source and VMID. Restore to the original VMID/storage '
+                    'unless overridden. Existing VMIDs are never overwritten. The restored VM stays stopped '
+                    'with onboot disabled; the cloud archive is retained.',
+        epilog='Run on the DESTINATION PVE but keep the ORIGINAL --source label. '
+               '--unique changes MAC addresses, not guest static IPs. '
+               'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100 --target-vmid 200 --storage destination-dir --unique. '
+               'Advanced: restore BACKUP_ID TARGET_VMID selects an older version from list --all-versions.')
     r.add_argument('backup_id', metavar='VMID', help='VMID to restore latest backup; advanced: explicit backup ID followed by target VMID')
     r.add_argument('vmid', type=vmid, nargs='?', help=argparse.SUPPRESS)
     r.add_argument('--target-vmid', type=vmid, help='Restore the selected source VM under another VMID')
     r.add_argument('--storage', help='Override original storage on destination server')
     r.add_argument('--unique', action='store_true', help='Generate new MAC addresses')
-    r.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True)
+    r.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain downloaded files after success (default: remove them)')
     r.add_argument('--cleanup-local', action='store_true', help=argparse.SUPPRESS)
-    listing = sub.add_parser('list')
+    listing = sub.add_parser('list', help='List latest complete cloud archive for each source VM',
+                            description='List VMID, VM name, format, snapshots and UTC archive date for the selected --source. '
+                                        'Incomplete uploads are omitted. Use --all-versions to include older versions and their backup IDs.')
     listing.add_argument('--all-versions', action='store_true', help='Show older versions and internal backup IDs')
-    v = sub.add_parser('verify')
+    v = sub.add_parser('verify', help='Advanced: download and check an explicit backup ID',
+                       description='Download and verify an archive selected from list --all-versions. '
+                                   'No VM is created or deleted. Downloaded files are retained unless --cleanup-local is used.')
     v.add_argument('backup_id', type=backup_id)
     v.add_argument('--cleanup-local', action='store_true')
     return p
