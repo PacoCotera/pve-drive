@@ -1,4 +1,4 @@
-# Admin quick start — version 0.4.3
+# Admin quick start — version 0.5.0
 
 **Experimental:** complete a test upload, restore, and snapshot rollback before relying on VM deletion. Use `--keep-vm` for the first upload.
 
@@ -76,3 +76,26 @@ Use the exact staging directory printed by your failed operation. Leave the VM s
 ## Built-in help
 
 Run `pve-drive --help`, `pve-drive upload --help`, `pve-drive list --help`, or `pve-drive restore --help` for examples and defaults. Global options go before the command. Wait for active uploads/restores to finish before running the installer.
+
+## Progress and troubleshooting
+
+The default display shows stages and elapsed time. Disk copying, SHA-256 checks,
+and rclone transfers show percentage, bytes, speed, and estimated time remaining
+when totals are available. Stages without measurable byte progress show elapsed
+time only; cloud read-back verification can take as long as a download.
+An interactive terminal refreshes the progress line; redirected output prints
+periodic lines without terminal control codes.
+
+Each run prints the path of its private diagnostic log under `/var/log/pve-drive/`.
+Logs include commands, tool output, and archive IDs. They can contain VM names,
+configuration, and storage paths: review before sharing. Logs are retained;
+remove old logs when no longer needed.
+
+To show raw commands and tool output as well, put `--verbose` before the command:
+
+```bash
+pve-drive --verbose --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
+```
+
+Display updates take effect on the next run after installation. Let an active
+upload or restore finish before updating.

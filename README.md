@@ -1,6 +1,6 @@
 # pve-drive
 
-Move Proxmox QEMU VMs to Google Shared Drive using rclone, and restore them by VMID. Version **0.4.3**.
+Move Proxmox QEMU VMs to Google Shared Drive using rclone, and restore them by VMID. Version **0.5.0**.
 
 **Status: experimental.** Automated tests cover simulated lifecycle failures and local copying, but end-to-end Proxmox/Drive restore and snapshot rollback validation is still in progress. Test with `--keep-vm` before using this tool to delete a VM.
 
@@ -113,7 +113,7 @@ The archive does not package host bridges, storage definitions, Proxmox firewall
 
 ## Space and maintenance requirements
 
-Default staging: `/var/lib/vz/pve-drive`. Set `--work-dir PATH` before the command to use another filesystem. QCOW2 files containing snapshots can exceed the guest disk capacity. Native archives are uncompressed. New native staging requires the full file length plus 1 GiB; restore needs both a download and a destination copy. On one filesystem, allow approximately twice the archive size plus headroom. Sparse savings are not assumed. Failed space checks may leave downloaded files for inspection.
+Default staging: `/var/lib/vz/pve-drive`. Set `--work-dir PATH` before the command to use another filesystem. QCOW2 files containing snapshots can be larger than the guest disk capacity. Native archives are uncompressed. New native staging requires the full file length plus 1 GiB; restore needs both a download and a destination copy. On one filesystem, allow approximately twice the archive size plus headroom. Sparse savings are not assumed. Failed space checks may leave downloaded files for inspection.
 
 Use an exclusive maintenance window. Do not start, modify, migrate, unlock, or replace the VM during an operation. The tool serializes its own tasks on each node and uses a Proxmox backup lock. It does not prevent administrators from bypassing locks. In VMA mode, Proxmox holds its normal backup lock during vzdump, followed by the tool's upload lock. In native mode the tool holds a backup lock before copying.
 
@@ -171,3 +171,26 @@ From the source checkout, run `python3 -m unittest discover -s tests -v`. Tests 
 ## License
 
 MIT License, copyright (c) 2026 Paco Cotera. See [LICENSE](LICENSE). Proxmox, QEMU, rclone, and other external dependencies retain their own licenses.
+
+## Progress and troubleshooting
+
+The default display shows stages and elapsed time. Disk copying, SHA-256 checks,
+and rclone transfers show percentage, bytes, speed, and estimated time remaining
+when totals are available. Stages without measurable byte progress show elapsed
+time only; cloud read-back verification can take as long as a download.
+An interactive terminal refreshes the progress line; redirected output prints
+periodic lines without terminal control codes.
+
+Each run prints the path of its private diagnostic log under `/var/log/pve-drive/`.
+Logs include commands, tool output, and archive IDs. They can contain VM names,
+configuration, and storage paths: review before sharing. Logs are retained;
+remove old logs when no longer needed.
+
+To show raw commands and tool output as well, put `--verbose` before the command:
+
+```bash
+pve-drive --verbose --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
+```
+
+Display updates take effect on the next run after installation. Let an active
+upload or restore finish before updating.

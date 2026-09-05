@@ -14,19 +14,202 @@ import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.4.3'
+__version__ = '0.5.0'
+
+
+def duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+
+def human_bytes(value):
+    value = float(value)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if abs(value) < 1024 or unit == 'TiB':
+            return f'{value:.1f} {unit}'
+        value /= 1024
+
+
+class Console:
+    def __init__(self, stream=None, verbose=False, log=None):
+        self.stream = stream or sys.stderr
+        self.verbose = verbose
+        self.log = log
+        self.enabled = False
+        self.started = time.monotonic()
+        self.phase_started = self.started
+        self.phase = ''
+        self.last = self.phase_started
+        self.live = False
+
+    def record(self, text):
+        if self.log:
+            self.log.write(text)
+            self.log.flush()
+
+    def clear(self):
+        if self.live:
+            self.stream.write('\r\033[2K')
+            self.stream.flush()
+            self.live = False
+
+    def note(self, text):
+        self.record(text + '\n')
+        if self.enabled:
+            self.clear()
+            print(f'[{duration(time.monotonic() - self.started)}] {text}', file=self.stream, flush=True)
+
+    def stage(self, label):
+        self.clear()
+        self.phase = label
+        self.phase_started = time.monotonic()
+        self.last = self.phase_started
+        self.note(label)
+
+    def update(self, done=None, total=None, speed=None, elapsed=None, force=False):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        tty = self.stream.isatty() and not self.verbose
+        if not force and now - self.last < (1 if tty else 15):
+            return
+        self.last = now
+        elapsed = now - self.phase_started if elapsed is None else elapsed
+        if total and done is not None:
+            speed = done / max(elapsed, .001) if speed is None else max(0, speed)
+            eta = duration(max(0, total - done) / speed) if speed > 0 else '--:--:--'
+            text = (f'{self.phase} | {min(100, 100 * done / total):5.1f}% | '
+                    f'{human_bytes(done)} / {human_bytes(total)} | '
+                    f'{human_bytes(speed)}/s | elapsed {duration(elapsed)} | ETA {eta}')
+        else:
+            text = f'{self.phase} | elapsed {duration(elapsed)}'
+        if tty:
+            # Keep redraws on one physical line, including narrow SSH terminals.
+            text = text.removeprefix(self.phase + ' | ')
+            width = shutil.get_terminal_size(fallback=(100, 24)).columns
+            text = text[:max(1, width - 1)]
+            self.stream.write('\r\033[2K' + text)
+            self.stream.flush()
+            self.live = True
+        else:
+            print(text, file=self.stream, flush=True)
+        if force:
+            self.record(text + '\n')
+
+    def command(self, args):
+        text = '+ ' + ' '.join(args) + '\n'
+        self.record(text)
+        if self.verbose and self.enabled:
+            self.clear()
+            print(text, end='', file=self.stream, flush=True)
+
+    def output(self, text, rclone=False):
+        self.record(text)
+        if self.verbose and self.enabled:
+            self.clear()
+            print(text, end='', file=self.stream, flush=True)
+        if rclone:
+            for line in text.splitlines():
+                try:
+                    entry = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                stats = entry.get('stats')
+                if isinstance(stats, dict):
+                    self.update(stats.get('bytes'), stats.get('totalBytes'), stats.get('speed'), stats.get('elapsedTime'))
+                elif entry.get('level') in ('warning', 'error', 'fatal') and not self.verbose:
+                    self.note(entry.get('msg', line))
+
+
+console = Console()
 
 def run(*args, capture=False):
-    print('+ ' + ' '.join(map(str, args)), file=sys.stderr, flush=True)
-    return subprocess.run(list(map(str, args)), check=True, text=True,
-                          stdout=subprocess.PIPE if capture else None).stdout
+    args = list(map(str, args))
+    console.command(args)
+    label = None
+    if args[0] == 'vzdump':
+        label = 'Creating VM backup'
+    elif args[0] == 'qmrestore':
+        label = 'Restoring VM disks'
+    elif args[:2] == ['qm', 'shutdown']:
+        label = 'Stopping VM gracefully'
+    elif args[:2] == ['qm', 'destroy']:
+        label = 'Removing verified VM from Proxmox'
+    elif args[:2] == ['qemu-img', 'check']:
+        label = 'Checking QCOW2 integrity'
+    rclone = args[0] == 'rclone' and '--use-json-log' in args
+    if label:
+        console.stage(label)
+    # File-backed output keeps long backups bounded in memory. Separate readers
+    # avoid changing the child process's file offsets while it is writing.
+    with tempfile.TemporaryDirectory(prefix='pve-drive-output-') as tmp:
+        out_path, err_path = Path(tmp) / 'stdout', Path(tmp) / 'stderr'
+        with out_path.open('wb') as out, err_path.open('wb') as err:
+            proc = subprocess.Popen(args, stdout=out, stderr=err)
+            with out_path.open('r', errors='replace') as out_reader, err_path.open('r', errors='replace') as err_reader:
+                pending = ''
+                def drain(final=False):
+                    nonlocal pending
+                    text = out_reader.read()
+                    if text:
+                        console.output(text)
+                    pending += err_reader.read()
+                    end = len(pending) if final else pending.rfind('\n') + 1
+                    if end:
+                        console.output(pending[:end], rclone=rclone)
+                        pending = pending[end:]
+                try:
+                    while proc.poll() is None:
+                        try:
+                            proc.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        drain()
+                        if proc.poll() is None and not rclone:
+                            console.update()
+                except BaseException:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    drain(final=True)
+                    raise
+                drain(final=True)
+        console.clear()
+        if proc.returncode:
+            with err_path.open('rb') as f:
+                f.seek(max(0, err_path.stat().st_size - 4000))
+                detail = f.read().decode(errors='replace').strip()
+            if not detail:
+                with out_path.open('rb') as f:
+                    f.seek(max(0, out_path.stat().st_size - 4000))
+                    detail = f.read().decode(errors='replace').strip()
+            raise RuntimeError(f'{args[0]} failed (exit {proc.returncode}): {detail}')
+        return out_path.read_text(errors='replace') if capture else None
 
 
 def sha256(path):
     h = hashlib.sha256()
+    total = Path(path).stat().st_size
+    show = total >= 64 * 1024 * 1024
+    if show:
+        console.stage(f'Verifying SHA-256: {Path(path).name}')
+    done = 0
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(8 * 1024 * 1024), b''):
             h.update(chunk)
+            done += len(chunk)
+            if show:
+                console.update(done, total)
+    if show:
+        console.update(done, total, force=True)
+        console.clear()
     return h.hexdigest()
 
 
@@ -45,8 +228,7 @@ def stream_copy(source, destination):
     block_size = 8 * 1024 * 1024
     zero_block = bytes(block_size)
     copied = 0
-    last_report = time.monotonic()
-    print(f'Sequential copy: {source} -> {destination} ({total} bytes)', file=sys.stderr, flush=True)
+    console.stage(f'Copying disk: {source.name}')
     with source.open('rb') as src, destination.open('wb') as dst:
         while True:
             data = src.read(block_size)
@@ -57,13 +239,12 @@ def stream_copy(source, destination):
             else:
                 dst.write(data)
             copied += len(data)
-            if time.monotonic() - last_report >= 15:
-                print(f'Copied {copied}/{total} bytes ({100 * copied / max(total, 1):.1f}%)', file=sys.stderr, flush=True)
-                last_report = time.monotonic()
+            console.update(copied, total)
         dst.truncate(copied)
         dst.flush()
         os.fsync(dst.fileno())
-    print(f'Copy finished: {copied} bytes; verifying SHA-256.', file=sys.stderr, flush=True)
+    console.update(copied, total, force=True)
+    console.clear()
 
 
 def verified_native_copy(source, destination, report_path):
@@ -244,8 +425,20 @@ class Manager:
         self.work = Path(args.work_dir).resolve()
 
     def rc(self, *args, capture=False):
+        progress = []
+        if not capture and args[0] in ('copy', 'copyto', 'check'):
+            if args[0] == 'check':
+                label = 'Verifying cloud archive by reading it back'
+            elif str(args[1]).startswith(self.base + '/'):
+                label = 'Downloading archive'
+            elif 'COMPLETE' in str(args[1]):
+                label = 'Finalizing cloud archive'
+            else:
+                label = 'Uploading archive'
+            console.stage(label)
+            progress = ['--stats', '2s', '--stats-log-level', 'NOTICE', '--use-json-log']
         return run('rclone', '--config', self.a.rclone_config,
-                   '--retries', '5', '--low-level-retries', '10', *args, capture=capture)
+                   '--retries', '5', '--low-level-retries', '10', *args, *progress, capture=capture)
 
     def api(self, path):
         return json.loads(run('pvesh', 'get', path, '--output-format', 'json', capture=True))
@@ -273,7 +466,7 @@ class Manager:
     def stage(self, prefix):
         self.work.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = Path(tempfile.mkdtemp(prefix=prefix, dir=self.work))
-        print(f'Local recovery files: {path}', file=sys.stderr)
+        console.note(f'Recovery files: {path}')
         return path
 
     def archive(self):
@@ -352,7 +545,8 @@ class Manager:
         self.rc('copyto', marker, f'{destination}/COMPLETE', '--immutable')
         if self.rc('cat', f'{destination}/COMPLETE', capture=True) != marker.read_text():
             raise ValueError('Completion marker verification failed')
-        print(f'Verified source: {self.a.source}; backup ID: {ident_backup}', flush=True)
+        console.note(f'Cloud archive verified for VM {ident}')
+        console.record(f'Backup ID: {ident_backup}\n')
         self.unchanged(ident, locked.copy())
         if self.a.delete_vm:
             # Bypass only the lock just created and checked above.
@@ -363,7 +557,7 @@ class Manager:
             run('qm', 'unlock', ident)
         if self.a.cleanup_local:
             shutil.rmtree(stage)
-        print('Archive complete. VM ' + ('deleted.' if self.a.delete_vm else 'retained, stopped.'))
+        console.note('Archive complete. VM ' + ('deleted.' if self.a.delete_vm else 'retained, stopped.'))
 
     def manifest(self, bid):
         destination = f'{self.base}/{backup_id(bid)}'
@@ -422,7 +616,7 @@ class Manager:
         self.stopped(ident)
         if self.a.cleanup_local:
             shutil.rmtree(stage)
-        print(f'Restored VM {ident}, stopped with onboot disabled. Drive backup retained.')
+        console.note(f'Restored VM {ident}, stopped with onboot disabled. Drive backup retained.')
 
     def listing(self):
         rows = json.loads(self.rc('lsjson', self.base, '--recursive', '--files-only', capture=True))
@@ -446,7 +640,7 @@ class Manager:
         stage, _ = self.download()
         if self.a.cleanup_local:
             shutil.rmtree(stage)
-        print('Remote archive verified by download and SHA-256.')
+        console.note('Remote archive verified by download and SHA-256.')
 
     def config_file(self, ident):
         return Path(f'/etc/pve/qemu-server/{ident}.conf')
@@ -516,7 +710,7 @@ class Manager:
             locked_raw = self.config_file(ident).read_text()
             if re.sub(r'^lock: backup\n', '', locked_raw, flags=re.M) != raw:
                 raise ValueError('VM or snapshot configuration differs from the failed operation')
-            print(f'Resuming failed local copy in {stage}; retaining the VM lock.', file=sys.stderr)
+            console.note(f'Resuming local copy; VM remains stopped and locked. Recovery files: {stage}')
         else:
             raw = self.config_file(ident).read_text()
         sections = parse_native_config(raw)
@@ -582,7 +776,8 @@ class Manager:
         self.rc('copyto', marker, destination + '/COMPLETE', '--immutable')
         if self.rc('cat', destination + '/COMPLETE', capture=True) != marker.read_text():
             raise ValueError('Completion marker verification failed')
-        print(f'Verified source: {self.a.source}; native backup ID: {bid}; snapshots: {snapshots}', flush=True)
+        console.note(f'Cloud archive verified for VM {ident}; snapshots: {snapshots}')
+        console.record(f'Backup ID: {bid}\n')
         self.unchanged(ident, locked.copy())
         if self.config_file(ident).read_text() != locked_raw:
             raise ValueError('Snapshot configuration changed; refusing deletion')
@@ -597,7 +792,7 @@ class Manager:
             run('qm', 'unlock', ident)
         if self.a.cleanup_local:
             shutil.rmtree(stage)
-        print('Native archive complete; ' + ('VM deleted.' if self.a.delete_vm else 'VM retained, stopped.'))
+        console.note('Native archive complete; ' + ('VM deleted.' if self.a.delete_vm else 'VM retained, stopped.'))
 
     def validate_native_manifest(self, m):
         if m.get('format') != 'native-qcow2' or not isinstance(m.get('disks'), list) or not m['disks']:
@@ -696,7 +891,7 @@ class Manager:
         recovery_path.write_text(json.dumps(recovery, indent=2))
         if self.a.cleanup_local:
             shutil.rmtree(stage)
-        print(f'Native VM {ident} restored, stopped, onboot disabled; snapshots: {m["snapshots"]}. Drive copy retained.')
+        console.note(f'Native VM {ident} restored, stopped, onboot disabled; snapshots: {m["snapshots"]}. Drive copy retained.')
 
 
 def parser():
@@ -715,6 +910,7 @@ def parser():
                'Update after active tasks finish: cd /opt/pve-drive && git pull --ff-only && sudo ./install.sh\n'
                'More help: pve-drive upload --help | pve-drive restore --help | ADMIN.md')
     p.add_argument('--version', action='version', version=__version__)
+    p.add_argument('--verbose', action='store_true', help='Show commands and raw diagnostics (default: concise progress). Full logs: /var/log/pve-drive/')
     p.add_argument('--remote', required=True, help='Configured rclone remote:dedicated-folder')
     sources = p.add_mutually_exclusive_group(required=True)
     sources.add_argument('--source', type=source_name,
@@ -780,11 +976,20 @@ def parser():
 
 
 def main():
+    global console
     args = parser().parse_args()
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise ValueError('Run as root on Linux (archive/restore require a Proxmox node)')
     import fcntl
     os.umask(0o077)
+    log_dir = Path('/var/log/pve-drive')
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_path = log_dir / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex[:8] + '.log')
+    console = Console(verbose=args.verbose, log=log_path.open('x', encoding='utf-8'))
+    console.enabled = True
+    console.note(f'pve-drive {__version__} | {args.command} | source {args.source or "legacy"}')
+    console.note(f'Log: {log_path}')
+    console.stage('Checking prerequisites')
     # One operation per node, regardless of work directory or destination.
     with open('/run/lock/pve-drive.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -795,13 +1000,19 @@ def main():
         else:
             method = {'list': 'listing', 'upload': 'move_to_cloud'}.get(args.command, args.command.replace('-', '_'))
             getattr(manager, method)()
+    console.note('Complete')
 
 
 if __name__ == '__main__':
     try:
         main()
     except (Exception, KeyboardInterrupt) as exc:
+        console.clear()
+        console.record(f'ERROR: {exc}\n')
         print(f'ERROR: {exc}\nIf failure occurred during preflight, no VM changes were made. '
               'If shutdown or backup already started, inspect the task and VM state before retrying; '
               'see README recovery. Any recovery files created are retained.', file=sys.stderr)
         sys.exit(1)
+    finally:
+        if console.log:
+            console.log.close()
