@@ -35,6 +35,35 @@ class ProgressTests(unittest.TestCase):
         c.note('Done')
         self.assertFalse(c.live)
 
+    def test_estimated_total_and_eta_are_explicit(self):
+        c, stream = self.display()
+        c.update(512, 1024, speed=128, elapsed=4, estimated=True, force=True)
+        self.assertIn('est. max', stream.getvalue())
+        self.assertIn('50.0% of est. max', stream.getvalue())
+        self.assertIn('ETA (est. max) 00:00:04', stream.getvalue())
+
+    def test_exceeded_estimate_does_not_claim_completion(self):
+        c, stream = self.display()
+        c.update(2048, 1024, estimated=True, force=True)
+        self.assertIn('estimate exceeded; ETA unknown', stream.getvalue())
+        self.assertNotIn('100%', stream.getvalue())
+
+    def test_virtual_capacity_estimate_includes_overhead_and_excludes_cdrom(self):
+        cfg = {'scsi0': 'local:disk,size=32G', 'scsi1': 'pool:disk,size=240G',
+               'scsi2': 'pool:large,size=1T', 'ide2': 'none,media=cdrom'}
+        size = 1296 * 1024 ** 3
+        self.assertEqual(p.stream_size_estimate(cfg), (size * 102 + 99) // 100 + 64 * 1024 ** 2)
+
+    def test_incomplete_sizes_disable_estimate(self):
+        for value in ['pool:disk', 'pool:disk,size=unknown', 'pool:disk,size=0G']:
+            self.assertIsNone(p.stream_size_estimate({'scsi0': 'pool:disk,size=1G', 'scsi1': value}))
+
+    def test_small_and_fractional_disk_sizes(self):
+        size = int(1.5 * 1024 ** 3) + 4 * 1024 ** 2
+        self.assertEqual(p.stream_size_estimate({'scsi0': 'pool:disk,size=1.5G',
+                                                'efidisk0': 'pool:efi,size=4M'}),
+                         (size * 102 + 99) // 100 + 64 * 1024 ** 2)
+
     def test_rclone_stats_and_warning(self):
         c, stream = self.display()
         c.stage('Uploading')

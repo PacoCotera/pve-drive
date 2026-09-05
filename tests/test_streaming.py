@@ -48,6 +48,12 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             p.stream_pipeline(producer, consumer, consumer, self.stage)
 
+    def test_size_estimate_never_limits_upload_data(self):
+        producer = self.command('import sys; sys.stdout.buffer.write(b"archive")')
+        consumer = self.command('import sys; assert sys.stdin.buffer.read()==b"archive"')
+        result = p.stream_pipeline(producer, consumer, consumer, self.stage, estimated_total=1)
+        self.assertEqual(result['size'], 7)
+
     def test_producer_diagnostic_is_reported_with_downstream_failure(self):
         producer = self.command('import sys; print("backup worker startup failed", file=sys.stderr); sys.exit(25)')
         consumer = self.command('import sys; sys.stdin.buffer.read(); sys.exit(1)')

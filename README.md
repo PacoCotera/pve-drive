@@ -65,6 +65,8 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --stream --
 
 Streaming requires a remote with streaming upload and MD5 support, such as Google Drive. Interrupted transfers restart from the beginning. Native QCOW2 snapshot archives require staging.
 
+Streaming upload progress shows an estimated maximum size and ETA based on configured disk capacities plus an overhead allowance. Compression can make the actual archive substantially smaller.
+
 ### List
 
 List the latest complete archive for each source VM, including archive size and snapshot names:

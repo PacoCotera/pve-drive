@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,7 +18,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.8.1'
+__version__ = '0.8.2'
 
 
 def duration(seconds):
@@ -71,7 +72,7 @@ class Console:
         self.last = self.phase_started
         self.note(label)
 
-    def update(self, done=None, total=None, speed=None, elapsed=None, force=False):
+    def update(self, done=None, total=None, speed=None, elapsed=None, force=False, estimated=False):
         if not self.enabled:
             return
         now = time.monotonic()
@@ -80,7 +81,17 @@ class Console:
             return
         self.last = now
         elapsed = now - self.phase_started if elapsed is None else elapsed
-        if total and done is not None:
+        if estimated and total and done is not None:
+            speed = done / max(elapsed, .001) if speed is None else max(0, speed)
+            if done < total:
+                eta = duration((total - done) / speed) if speed > 0 else '--:--:--'
+                text = (f'{self.phase} | {human_bytes(done)} / est. max {human_bytes(total)} | '
+                        f'{100 * done / total:.1f}% of est. max | {human_bytes(speed)}/s | '
+                        f'ETA (est. max) {eta} | elapsed {duration(elapsed)}')
+            else:
+                text = (f'{self.phase} | {human_bytes(done)} | {human_bytes(speed)}/s | '
+                        f'estimate exceeded; ETA unknown | elapsed {duration(elapsed)}')
+        elif total and done is not None:
             speed = done / max(elapsed, .001) if speed is None else max(0, speed)
             eta = duration(max(0, total - done) / speed) if speed > 0 else '--:--:--'
             text = (f'{self.phase} | {min(100, 100 * done / total):5.1f}% | '
@@ -202,7 +213,7 @@ def run(*args, capture=False):
 
 
 def stream_pipeline(producer_args, upload_args, check_args, stage, *,
-                    downstream_args=None, total=None, producer_name='vzdump'):
+                    downstream_args=None, total=None, producer_name='vzdump', estimated_total=None):
     """Relay and hash compressed bytes without an archive file or unbounded queue."""
     stage = Path(stage)
     processes, readers = [], []
@@ -306,12 +317,14 @@ def stream_pipeline(producer_args, upload_args, check_args, stage, *,
                     raise RuntimeError(f'Stream process failed: {failed}; see {stage}')
                 if errors:
                     raise RuntimeError(f'Stream pipe failed: {errors[0]}; see {stage}') from errors[0]
-                console.update(state['size'], total)
+                console.update(state['size'], total if total is not None else estimated_total,
+                               estimated=total is None and estimated_total is not None)
                 time.sleep(.2)
             if errors or any(proc.returncode != 0 for _, proc in processes) or not state['size']:
                 raise RuntimeError(f'Incomplete or empty backup stream; see {stage}')
             drain()
-            console.update(state['size'], total, force=True)
+            console.update(state['size'], total if total is not None else estimated_total, force=True,
+                           estimated=total is None and estimated_total is not None)
             return dict(state, sha256=digest.hexdigest(), md5=md5.hexdigest())
         except BaseException as exc:
             stop()
@@ -342,6 +355,24 @@ def stream_pipeline(producer_args, upload_args, check_args, stage, *,
                             pass
             drain()
             console.clear()
+
+
+def stream_size_estimate(config):
+    """Conservative display estimate, never an integrity limit or space check."""
+    total = 0
+    for key, value in config.items():
+        if not DISK_KEY.fullmatch(key) or 'media=cdrom' in str(value).split(','):
+            continue
+        match = re.search(r'(?:^|,)size=([0-9]+(?:\.[0-9]+)?)([KMGTPE]?)(?:,|$)', str(value))
+        if not match:
+            return None  # Never silently omit a disk from the estimate.
+        size = float(match[1]) * 1024 ** ('KMGTPE'.index(match[2]) + 1 if match[2] else 0)
+        if not math.isfinite(size) or size <= 0:
+            return None
+        total += math.ceil(size)
+    # VMA block records and zstd framing can expand incompressible input.
+    # Config sizes can be stale, so this is deliberately not a guaranteed bound.
+    return (total * 102 + 99) // 100 + 64 * 1024 ** 2 if total else None
 
 
 def file_hash(path, algorithm='sha256'):
@@ -846,13 +877,17 @@ class Manager:
         self.unchanged(ident, cfg.copy())
         tmp = stage / 'tmp'
         tmp.mkdir()
+        estimate = stream_size_estimate(cfg)
+        if estimate is not None:
+            console.note(f'Estimated maximum archive size: {human_bytes(estimate)} '
+                         '(configured disk capacity + 2% + 64 MiB). Actual size may be smaller.')
         result = stream_pipeline(
             ['vzdump', ident, '--mode', 'stop', '--compress', 'zstd', '--stdout', '1',
              '--tmpdir', str(tmp), '--remove', '0'],
             ['rclone', '--config', self.a.rclone_config, '--retries', '1', '--low-level-retries', '10',
              'rcat', destination + '/' + filename, '--streaming-upload-cutoff', '1M',
              '--buffer-size', '8M', '--drive-chunk-size', '32M'],
-            ['zstd', '--test', '-'], stage)
+            ['zstd', '--test', '-'], stage, estimated_total=estimate)
         # Successful processes are necessary, but also require every configured
         # data disk to be acknowledged by vzdump before certifying the stream.
         expected_disks = {key: str(value).split(',')[0] for key, value in cfg.items()
@@ -1484,7 +1519,7 @@ def parser():
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
     to.add_argument('vmid', type=vmid)
     to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
-    to.add_argument('--stream', action='store_true', help='Stream VMA directly to cloud without a local archive; requires no snapshots and remote streaming/MD5 support. Interrupted streams restart from the beginning')
+    to.add_argument('--stream', action='store_true', help='Stream VMA directly to cloud without a local archive; requires no snapshots and remote streaming/MD5 support. Progress uses an estimated maximum size/ETA; interrupted streams restart from the beginning')
     to.add_argument('--deep-verify', action='store_true', help='Verify upload by downloading it again (default: require matching cloud sizes and MD5 hashes)')
     to.add_argument('--resume', metavar='STAGING_DIR', help='Retry a failed native local copy in its existing staging directory')
     to.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Retain staging after success (default: remove it); failures retain files')
