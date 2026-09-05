@@ -171,13 +171,9 @@ class NativeTests(unittest.TestCase):
         self.assertFalse(any(c[:2] == ['qm', 'destroy'] for c in self.commands))
 
     def test_bad_local_copy_retains_hash_evidence_and_never_uploads(self):
-        original = self.fake_run
-        def corrupt(*args, **kwargs):
-            result = original(*args, **kwargs)
-            if str(args[0]) == 'cp':
-                Path(args[-1]).write_bytes(b'bad copy')
-            return result
-        with self.harness(), patch.object(p, 'run', corrupt), \
+        def corrupt(source, destination):
+            Path(destination).write_bytes(b'bad copy')
+        with self.harness(), patch.object(p, 'stream_copy', corrupt), \
                 self.assertRaisesRegex(ValueError, 'Copied bytes differ'):
             self.archive()
         report = json.loads(next(self.root.rglob('copy-mismatch.json')).read_text())
@@ -192,11 +188,66 @@ class NativeTests(unittest.TestCase):
         def change_then_copy(*args, **kwargs):
             self.disk.write_bytes(b'new source data')
             shutil.copyfile(self.disk, destination)
-        with patch.object(p, 'run', change_then_copy), \
+        with patch.object(p, 'stream_copy', change_then_copy), \
                 self.assertRaisesRegex(ValueError, 'Source changed'):
             p.verified_native_copy(self.disk, destination, report_path)
         report = json.loads(report_path.read_text())
         self.assertEqual(report['source_sha256_after'], report['destination_sha256'])
+
+    def test_stream_copy_preserves_sparse_content_and_truncates_old_tail(self):
+        with self.disk.open('wb') as f:
+            f.seek(8 * 1024 * 1024)
+            f.write(b'data near a block boundary')
+            f.seek(17 * 1024 * 1024)
+            f.write(b'final nonzero data')
+            f.truncate(24 * 1024 * 1024 + 19)
+        destination = self.root / 'old-copy.qcow2'
+        with destination.open('wb') as f:
+            f.write(b'old bytes')
+            f.truncate(30 * 1024 * 1024)
+        p.stream_copy(self.disk, destination)
+        self.assertEqual(self.disk.stat().st_size, destination.stat().st_size)
+        self.assertEqual(p.sha256(self.disk), p.sha256(destination))
+
+    def test_stream_copy_refuses_same_source(self):
+        before = self.disk.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'source disk'):
+            p.stream_copy(self.disk, self.disk)
+        self.assertEqual(self.disk.read_bytes(), before)
+
+    def failed_copy_stage(self):
+        def corrupt(source, destination):
+            Path(destination).write_bytes(b'failed copy')
+        with self.harness(), patch.object(p, 'stream_copy', corrupt), self.assertRaises(ValueError):
+            self.archive()
+        return next((self.root / 'stage').glob('native-100-*'))
+
+    def test_resume_reuses_failed_copy_and_keeps_vm_when_requested(self):
+        stage = self.failed_copy_stage()
+        self.args.resume = str(stage)
+        self.args.keep_vm = True
+        self.args.delete_vm = False
+        self.args.cleanup_local = False
+        with self.harness():
+            self.archive()
+        self.assertEqual(len(list((self.root / 'stage').iterdir())), 1)
+        self.assertEqual((stage / 'payload/scsi0.qcow2').read_bytes(), self.disk.read_bytes())
+        self.assertEqual(self.file('100').read_text(), CONFIG)
+        self.assertEqual(sum(c[:2] == ['qm', 'shutdown'] for c in self.commands), 1)
+
+    def test_resume_rejects_changed_configuration_without_rewriting_copy(self):
+        stage = self.failed_copy_stage()
+        self.args.resume = str(stage)
+        self.file('100').write_text(self.file('100').read_text().replace('memory: 24576', 'memory: 8192'))
+        with self.harness(), self.assertRaisesRegex(ValueError, 'differs from the failed operation'):
+            self.archive()
+        self.assertEqual((stage / 'payload/scsi0.qcow2').read_bytes(), b'failed copy')
+
+    def test_resume_rejects_wrong_directory(self):
+        self.failed_copy_stage()
+        self.args.resume = str(self.root)
+        with self.harness(), self.assertRaisesRegex(ValueError, 'directly under'):
+            self.archive()
 
     def test_native_cross_id_restore_preserves_snapshot_disk_and_remaps_config(self):
         with self.harness():
