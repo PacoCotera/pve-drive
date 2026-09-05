@@ -29,7 +29,16 @@ rclone lsd gdrive:
 rclone mkdir gdrive:pve-archive
 ```
 
-Give each source server a unique label, such as `pve-site-a`. Keep that original label when listing or restoring its VMs. Global options go before the command.
+The examples below use these values; replace them with your own:
+
+| Parameter | Meaning |
+| --- | --- |
+| `--remote gdrive:pve-archive` | Cloud destination: `gdrive` is the remote you created in rclone, and `pve-archive` is the folder inside it. |
+| `--source pve-site-a` | A unique label you choose for the source Proxmox server. Keep using that original label when listing or restoring its VMs, even on another server. |
+| `upload 100` | The action (`upload`) followed by the existing Proxmox VM ID (`100`). Use `list` to browse archives or `restore 100` to restore that source VM’s latest archive. |
+| `--keep-vm` | Keep the original VM after a successful upload. It will be shut down and left stopped. Without this flag, upload deletes the original VM and its disks after verification. |
+
+Put global options such as `--remote` and `--source` **before** the action, and action-specific options such as `--keep-vm` **after** it. `--source` identifies the server’s archives; it does not connect to that server. Run uploads on the VM’s owning node.
 
 ## Upload, list, restore
 
@@ -53,7 +62,7 @@ Restore the latest archive to its original VMID and storage:
 pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
 ```
 
-Or restore on a destination node under another VMID and storage:
+Or restore on a destination node under another VMID and storage. `--target-vmid 200` selects an unused destination VM ID, `--storage destination-dir` selects an existing Proxmox storage ID, and `--unique` generates new MAC addresses:
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \
