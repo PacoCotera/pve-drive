@@ -36,7 +36,7 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 
 Use an existing mounted filesystem with adequate space. `--storage` chooses restored disk storage; `--work-dir` chooses temporary staging independently.
 
-Successful `upload` and `restore` remove staging by default; `--keep-local` retains it. Failures retain recovery files. `recover`, advanced `archive`, and `verify` retain staging unless `--cleanup-local` is supplied.
+Successful `upload`, `restore`, and `recover` remove staging by default; `--keep-local` retains it. Failed operations preserve recovery data; empty staging directories are removed when the initial space check fails. Advanced `archive` and `verify` retain staging unless `--cleanup-local` is supplied.
 
 ## Supported archives and limitations
 
@@ -90,7 +90,7 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 
 Run on the original source node with the original source label, complete local payload, and saved manifest. The VM must remain stopped and backup-locked. Recovery checks identity, configuration, local SHA-256, disk integrity, and cloud sizes/MD5. It computes SHA-256 and MD5 in one local read; it does not recopy, reupload, or download archive data. Only the completion marker is uploaded and read back.
 
-On success, the archive becomes available to `list`/`restore`, and the VM is retained, stopped, and unlocked. Recovery never deletes the VM. Staging is retained unless `--cleanup-local` is supplied. A matching existing cloud marker permits retry while the VM still holds its backup lock. Missing cloud files cannot be repaired by `recover`; they require a separate upload.
+On success, the archive becomes available to `list`/`restore`, and the VM is retained, stopped, and unlocked. Recovery never deletes the VM. Staging is removed after successful recovery; `--keep-local` retains it. The older `--cleanup-local` option remains accepted. A matching existing cloud marker permits retry while the VM still holds its backup lock. Missing cloud files cannot be repaired by `recover`; they require a separate upload.
 
 ### Other failures
 
@@ -116,3 +116,5 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a restore BACKUP_ID 200 
 Old `move-to-cloud`/`move-from-cloud` aliases remain available. `--legacy-layout` replaces `--source` for reading archives from before source folders existed; it does not allow uploads or recovery.
 
 Run `pve-drive COMMAND --help` for command options. From the checkout, `python3 -m unittest discover -s tests -v` runs simulated lifecycle tests and local copy/installer checks. These tests do not replace end-to-end Proxmox restore and snapshot rollback validation.
+
+Completion messages distinguish local staging cleanup from retention of the cloud archive. Upgrading does not remove directories retained by earlier versions; inspect those before manual cleanup.

@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.7.1'
+__version__ = '0.7.2'
 
 
 def duration(seconds):
@@ -516,6 +516,22 @@ class Manager:
             raise ValueError('VM configuration changed; refusing deletion')
         self.stopped(ident)
 
+    def require_staging_space(self, stage, required, message):
+        if shutil.disk_usage(stage).free < required:
+            # Remove only an empty directory. Existing recovery data is retained.
+            try:
+                stage.rmdir()
+            except OSError:
+                pass
+            raise ValueError(message)
+
+    def finish_staging(self, stage):
+        if self.a.cleanup_local:
+            shutil.rmtree(stage)
+            console.note('Local staging files removed')
+        else:
+            console.note(f'Local staging files retained: {stage}')
+
     def stage(self, prefix):
         self.work.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = Path(tempfile.mkdtemp(prefix=prefix, dir=self.work))
@@ -608,8 +624,7 @@ class Manager:
                 raise ValueError('VM still appears in cluster; retaining local backup')
         else:
             run('qm', 'unlock', ident)
-        if self.a.cleanup_local:
-            shutil.rmtree(stage)
+        self.finish_staging(stage)
         console.note('Archive complete. VM ' + ('deleted.' if self.a.delete_vm else 'retained, stopped.'))
 
     def manifest(self, bid):
@@ -718,8 +733,7 @@ class Manager:
             raise ValueError('Completion marker verification failed')
         check_vm()
         run('qm', 'unlock', ident)
-        if self.a.cleanup_local:
-            shutil.rmtree(stage)
+        self.finish_staging(stage)
         console.note(f'Recovery complete: VM {ident} retained, stopped and unlocked; cloud archive ready to restore')
 
     def download(self):
@@ -731,8 +745,8 @@ class Manager:
             print('NOTICE: This archive does not contain the original snapshot history: '
                   + ', '.join(m['excluded_snapshots']), file=sys.stderr)
         stage = self.stage('restore-')
-        if shutil.disk_usage(stage).free < m['size'] + 1024 ** 3:
-            raise ValueError('Insufficient staging space (requires archive size plus 1 GiB)')
+        self.require_staging_space(stage, m['size'] + 1024 ** 3,
+                                   'Insufficient staging space (requires archive size plus 1 GiB)')
         archive = stage / m['filename']
         self.rc('copyto', f"{destination}/{m['filename']}", archive)
         if archive.stat().st_size != m['size'] or sha256(archive) != m['sha256']:
@@ -756,9 +770,8 @@ class Manager:
         # Restores intentionally stay stopped for network/hardware inspection.
         run('qm', 'set', ident, '--onboot', '0')
         self.stopped(ident)
-        if self.a.cleanup_local:
-            shutil.rmtree(stage)
-        console.note(f'Restored VM {ident}, stopped with onboot disabled. Drive backup retained.')
+        self.finish_staging(stage)
+        console.note(f'Restored VM {ident}, stopped with onboot disabled. Cloud archive retained.')
 
     def listing(self):
         console.stage('Loading cloud archives...')
@@ -793,8 +806,7 @@ class Manager:
 
     def verify(self):
         stage, _ = self.download()
-        if self.a.cleanup_local:
-            shutil.rmtree(stage)
+        self.finish_staging(stage)
         console.note('Remote archive verified by download and SHA-256.')
 
     def config_file(self, ident):
@@ -886,8 +898,8 @@ class Manager:
         if not resume:
             stage = self.stage(f'native-{ident}-')
             total = sum(p.stat().st_size for p in sources.values())
-            if shutil.disk_usage(stage).free < total + 1024 ** 3:
-                raise ValueError(f'Native staging needs at least {total + 1024 ** 3} free bytes')
+            self.require_staging_space(stage, total + 1024 ** 3,
+                                       f'Native staging needs at least {total + 1024 ** 3} free bytes')
             run('qm', 'shutdown', ident, '--timeout', self.a.shutdown_timeout)
             self.unchanged(ident, cfg.copy())
             if self.config_file(ident).read_text() != raw:
@@ -945,8 +957,7 @@ class Manager:
                 raise ValueError('VM still appears in cluster; local copy retained')
         else:
             run('qm', 'unlock', ident)
-        if self.a.cleanup_local:
-            shutil.rmtree(stage)
+        self.finish_staging(stage)
         console.note('Native archive complete; ' + ('VM deleted.' if self.a.delete_vm else 'VM retained, stopped.'))
 
     def validate_native_manifest(self, m):
@@ -974,8 +985,8 @@ class Manager:
 
     def download_native(self, destination, m):
         stage = self.stage('native-download-')
-        if shutil.disk_usage(stage).free < m['size'] + 1024 ** 3:
-            raise ValueError('Insufficient staging space for native disk files')
+        self.require_staging_space(stage, m['size'] + 1024 ** 3,
+                                   'Insufficient staging space for native disk files')
         self.rc('copyto', destination + '/vm.conf', stage / 'vm.conf')
         if sha256(stage / 'vm.conf') != m['config_sha256']:
             raise ValueError('Native configuration checksum mismatch')
@@ -1044,9 +1055,8 @@ class Manager:
         run('qm', 'unlock', ident)
         recovery['status'] = 'complete'
         recovery_path.write_text(json.dumps(recovery, indent=2))
-        if self.a.cleanup_local:
-            shutil.rmtree(stage)
-        console.note(f'Native VM {ident} restored, stopped, onboot disabled; snapshots: {m["snapshots"]}. Drive copy retained.')
+        self.finish_staging(stage)
+        console.note(f'Native VM {ident} restored, stopped, onboot disabled; snapshots: {m["snapshots"]}. Cloud archive retained.')
 
 
 def parser():
@@ -1082,7 +1092,9 @@ def parser():
                     'Missing/incomplete cloud files fail; remotes must expose MD5.')
     recovery.add_argument('vmid', type=vmid)
     recovery.add_argument('--resume', required=True, metavar='STAGING_DIR', help='Exact existing staging directory printed by the interrupted upload')
-    recovery.add_argument('--cleanup-local', action='store_true', help='Remove staging only after successful recovery (default: retain it)')
+    recovery.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True,
+                          help='Retain staging after successful recovery (default: remove it); failures retain files')
+    recovery.add_argument('--cleanup-local', action='store_true', help=argparse.SUPPRESS)
     to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM, verify, then delete VM',
         description='Shut down the source VM, select the archive format automatically, upload and verify, then delete it. '
                     'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history.',

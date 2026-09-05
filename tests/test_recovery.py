@@ -123,8 +123,44 @@ class RecoveryTests(unittest.TestCase):
                 case.m.recover()
             self.assertEqual(calls, [])
 
-    def test_help_defaults_preserve_vm_and_local_files(self):
+    def test_help_defaults_preserve_vm_and_remove_local_files(self):
         args = p.parser().parse_args(['--remote', 'gdrive:archive', '--source', 'example',
                                       'recover', '100', '--resume', '/example'])
-        self.assertFalse(args.cleanup_local)
+        self.assertTrue(args.cleanup_local)
         self.assertFalse(hasattr(args, 'delete_vm'))
+
+    def test_success_removes_staging_when_cleanup_enabled(self):
+        case, stage, calls = self.prepare()
+        case.args.cleanup_local = True
+        case.m.recover()
+        self.assertFalse(stage.exists())
+        self.assertTrue(case.file('100').exists())
+        self.assertTrue(any(k.endswith('/COMPLETE') for k in case.remote))
+
+    def test_failure_preserves_data_with_cleanup_enabled(self):
+        case, stage, calls = self.prepare()
+        case.args.cleanup_local = True
+        del case.remote[next(k for k in case.remote if k.endswith('.qcow2'))]
+        with self.assertRaises(ValueError):
+            case.m.recover()
+        self.assertTrue((stage / 'payload/scsi0.qcow2').exists())
+        self.assertNotIn(['qm', 'unlock', '100'], case.commands)
+
+    def test_keep_local_and_old_cleanup_option(self):
+        base = ['--remote', 'gdrive:archive', '--source', 'example',
+                'recover', '100', '--resume', '/example']
+        self.assertFalse(p.parser().parse_args(base + ['--keep-local']).cleanup_local)
+        self.assertTrue(p.parser().parse_args(base + ['--cleanup-local']).cleanup_local)
+
+    def test_space_failure_removes_only_empty_staging(self):
+        from types import SimpleNamespace
+        case, stage, calls = self.prepare()
+        empty = stage.parent / 'empty-staging'
+        empty.mkdir()
+        with patch.object(p.shutil, 'disk_usage', return_value=SimpleNamespace(free=0)):
+            with self.assertRaises(ValueError):
+                case.m.require_staging_space(empty, 1024, 'No space')
+            self.assertFalse(empty.exists())
+            with self.assertRaises(ValueError):
+                case.m.require_staging_space(stage, 1024, 'No space')
+            self.assertTrue((stage / 'payload/scsi0.qcow2').exists())

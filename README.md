@@ -84,6 +84,8 @@ Restoration rejects occupied VM IDs and leaves the restored VM stopped. Guest st
 
 ## Operational notes
 
+- Successful upload, restore, and recovery remove local staging files by default. Use `--keep-local` to retain them. Files needed after an interrupted operation are preserved.
+
 - Supported internal QCOW2 disk snapshots are preserved; unsupported layouts are rejected.
 - Upload verification compares local file sizes and MD5 hashes against remote metadata. `--deep-verify` performs full read-back verification. Restoration validates SHA-256 checksums.
 - The default staging directory is `/var/lib/vz/pve-drive`; override it with the global option `--work-dir PATH`. Native restoration requires capacity for both the downloaded archive and the restored disks.
