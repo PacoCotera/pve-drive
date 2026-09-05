@@ -101,3 +101,36 @@ class CleanupTests(unittest.TestCase):
         self.a.apply = True
         with self.assertRaises(ValueError):
             self.execute()
+
+    def test_vmid_discovers_and_removes_multiple_attempts(self):
+        other = self.root / 'stream-100-second'
+        other.mkdir()
+        (other / 'attempt.json').write_text((self.stage / 'attempt.json').read_text())
+        self.a.stage = None
+        self.a.vmid = '100'
+        self.a.apply = True
+        self.execute()
+        self.assertFalse(self.stage.exists())
+        self.assertFalse(other.exists())
+
+    def test_vmid_preview_and_source_filter(self):
+        other = self.root / 'stream-100-other-source'
+        other.mkdir()
+        (other / 'attempt.json').write_text(json.dumps({'backup_id': self.bid, 'destination': 'other:source/' + self.bid}))
+        self.a.stage = None
+        self.a.vmid = '100'
+        self.execute()
+        self.assertTrue(self.stage.exists())
+        self.assertTrue(other.exists())
+        self.a.apply = True
+        self.execute()
+        self.assertFalse(self.stage.exists())
+        self.assertTrue(other.exists())
+
+    def test_vmid_retains_unidentified_attempt(self):
+        (self.stage / 'attempt.json').unlink()
+        self.a.stage = None
+        self.a.vmid = '100'
+        self.a.apply = True
+        self.execute()
+        self.assertTrue(self.stage.exists())

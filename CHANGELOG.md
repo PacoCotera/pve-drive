@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.4
+
+- Add `cleanup VMID` to discover recorded upload attempts by source and VM ID. Preview by default; add `--apply` to remove them without looking up staging paths.
+
 ## 0.8.3
 
 - Add `upload --stream --drive-chunk-size` to tune Google Drive upload chunks. The default remains 32 MiB; 128 MiB can be selected for throughput testing without changing compression settings.

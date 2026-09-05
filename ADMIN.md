@@ -69,6 +69,8 @@ See the upstream [vzdump documentation](https://pve.proxmox.com/pve-docs/vzdump.
 
 ## Cleanup policy
 
+`cleanup VMID` automatically discovers upload staging for the selected source and VM under `--work-dir`. It previews all matches before removal; add `--apply` to discard them. Attempts with another recorded source are excluded. Directories without source metadata are retained and reported for explicit `--stage PATH` inspection. Restore staging still uses `--stage PATH`. Completed cloud archives remain protected in both modes.
+
 Successful upload, restore, and recovery remove staging by default. `--keep-local` explicitly retains it. Failed operations retain local recovery data; cleanup is not automatic because it can make an otherwise recoverable upload unrecoverable. Completed cloud archives remain available after restore.
 
 Use `cleanup` to list local staging directories and `cleanup --stage PATH` to preview one abandoned attempt. Add `--apply` to discard that attempt's staging and any recorded incomplete cloud upload. The command requires a recognized directory directly under `--work-dir`, rejects symlinks and nested mounts, validates recorded source/VM identities, and checks for a cloud completion marker before deletion. Any completion marker protects the cloud archive. Remote listing or deletion errors preserve local recovery files. If no cloud destination was recorded, only the explicitly selected local directory is removed; the command does not guess remote paths or sweep unrelated backups.

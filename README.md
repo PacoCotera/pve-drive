@@ -109,11 +109,11 @@ Successful operations remove local staging unless `--keep-local` is used. Failed
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup
-pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup --stage /var/lib/vz/pve-drive/stream-100-EXAMPLE
-pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup --stage /var/lib/vz/pve-drive/stream-100-EXAMPLE --apply
+pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup 100
+pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup 100 --apply
 ```
 
-`cleanup` lists staging directories; `--stage` previews one attempt; `--apply` discards its local recovery files and recorded incomplete cloud upload. Completed cloud archives, VM disks, locks, and diagnostic logs are retained. Use the matching `--work-dir` for staging on another filesystem. Run cleanup after active tasks finish.
+`cleanup VMID` finds recorded upload attempts for the selected source and previews removal. `--apply` discards their local recovery files and recorded incomplete cloud uploads. Completed cloud archives, VM disks, locks, and diagnostic logs are retained. Use the matching `--work-dir` for staging on another filesystem. Run cleanup after active tasks finish. Advanced: `--stage PATH` selects one attempt, including restore staging or older directories without source records.
 
 ## Operational notes
 

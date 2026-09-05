@@ -18,7 +18,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.8.3'
+__version__ = '0.8.4'
 
 
 def duration(seconds):
@@ -766,6 +766,55 @@ class Manager:
         """Preview or discard one explicit attempt, never a completed cloud archive."""
         if not self.a.source:
             raise ValueError('Cleanup requires --source')
+        ident = getattr(self.a, 'vmid', None)
+        if ident is not None:
+            if self.a.stage:
+                raise ValueError('Choose VMID or --stage, not both')
+            attempts = []
+            for path in sorted(self.work.iterdir()) if self.work.is_dir() else []:
+                if not re.fullmatch(r'(native|archive|stream)-' + re.escape(ident) + r'-[A-Za-z0-9_-]+', path.name):
+                    continue
+                if path.is_symlink() or not path.is_dir():
+                    continue
+                recorded = False
+                record = path / 'attempt.json'
+                manifest = path / 'payload' / 'manifest.json'
+                if record.is_file() and not record.is_symlink():
+                    data = json.loads(record.read_text())
+                    bid = backup_id(data.get('backup_id', ''))
+                    if data.get('destination') != self.base + '/' + bid:
+                        continue
+                    recorded = True
+                elif manifest.is_file() and not manifest.is_symlink():
+                    data = json.loads(manifest.read_text())
+                    if data.get('source') != self.a.source:
+                        continue
+                    recorded = True
+                if recorded:
+                    attempts.append(path)
+                else:
+                    console.note(f'Unidentified attempt retained: {path}; use --stage to inspect it')
+            if not attempts:
+                console.note(f'No recorded upload attempts for source {self.a.source}, VM {ident}')
+                return
+            apply = self.a.apply
+            self.a.vmid = None
+            try:
+                # Validate and preview every match before deleting any of them.
+                self.a.apply = False
+                for path in attempts:
+                    self.a.stage = str(path)
+                    self.cleanup()
+                if apply:
+                    self.a.apply = True
+                    for path in attempts:
+                        self.a.stage = str(path)
+                        self.cleanup()
+            finally:
+                self.a.vmid = ident
+                self.a.stage = None
+                self.a.apply = apply
+            return
         if not self.a.stage:
             if self.a.apply:
                 raise ValueError('--apply requires one explicit --stage directory')
@@ -1596,6 +1645,7 @@ def parser():
                     'Completed cloud archives, VMs, VM disks, locks and diagnostic logs are retained. '
                     'Run after active tasks finish; use recover to finalize a recoverable upload instead.')
     cleanup.add_argument('--stage', metavar='PATH', help='Exact attempt directory directly under --work-dir')
+    cleanup.add_argument('vmid', nargs='?', type=vmid, help='Find all recorded upload attempts for this VM and source; no staging path required')
     cleanup.add_argument('--apply', action='store_true', help='Discard the selected attempt files; default is preview only')
     recovery = sub.add_parser('recover', help='Finalize an interrupted upload using its existing staging files',
         description='Verify existing local files with SHA-256 and cloud files with size/MD5, publish the completion marker, '
