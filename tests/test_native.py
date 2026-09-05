@@ -170,6 +170,34 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(self.file('100').exists())
         self.assertFalse(any(c[:2] == ['qm', 'destroy'] for c in self.commands))
 
+    def test_bad_local_copy_retains_hash_evidence_and_never_uploads(self):
+        original = self.fake_run
+        def corrupt(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if str(args[0]) == 'cp':
+                Path(args[-1]).write_bytes(b'bad copy')
+            return result
+        with self.harness(), patch.object(p, 'run', corrupt), \
+                self.assertRaisesRegex(ValueError, 'Copied bytes differ'):
+            self.archive()
+        report = json.loads(next(self.root.rglob('copy-mismatch.json')).read_text())
+        self.assertEqual(report['source_sha256_before'], report['source_sha256_after'])
+        self.assertNotEqual(report['source_sha256_before'], report['destination_sha256'])
+        self.assertFalse(self.remote)
+        self.assertTrue(self.file('100').exists())
+
+    def test_source_change_during_copy_is_reported(self):
+        destination = self.root / 'copy.qcow2'
+        report_path = self.root / 'copy-mismatch.json'
+        def change_then_copy(*args, **kwargs):
+            self.disk.write_bytes(b'new source data')
+            shutil.copyfile(self.disk, destination)
+        with patch.object(p, 'run', change_then_copy), \
+                self.assertRaisesRegex(ValueError, 'Source changed'):
+            p.verified_native_copy(self.disk, destination, report_path)
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report['source_sha256_after'], report['destination_sha256'])
+
     def test_native_cross_id_restore_preserves_snapshot_disk_and_remaps_config(self):
         with self.harness():
             m = self.archive()
