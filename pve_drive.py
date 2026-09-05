@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.7.2'
+__version__ = '0.7.3'
 
 
 def duration(seconds):
@@ -304,7 +304,9 @@ def safe_config(config):
             raise ValueError(f'Unsupported configuration: {key}')
         if key in ('protection', 'template') and value == '1':
             raise ValueError(f'VM has {key}=1')
-        if re.fullmatch(r'(unused|hostpci|usb|virtiofs)\d+', key):
+        if re.fullmatch(r'hostpci\d+', key):
+            pci_addresses(value)
+        if re.fullmatch(r'(unused|usb|virtiofs)\d+', key):
             raise ValueError(f'Unbacked resource: {key}')
         if re.fullmatch(r'(ide|sata|scsi|virtio|efidisk|tpmstate)\d+', key):
             volume = value.split(',')[0]
@@ -322,6 +324,47 @@ def safe_config(config):
         if re.fullmatch(r'(serial|parallel)\d+', key) and value != 'socket':
             raise ValueError(f'Host device: {key}')
     return external_media
+
+
+def pci_addresses(value):
+    """Accept direct PCI addresses only; a missing function means all functions."""
+    fields = str(value).split(',')
+    if any(field.startswith('host=') for field in fields[1:]):
+        raise ValueError('Duplicate PCI host assignment')
+    if any(field.startswith(('mapping=', 'mdev=')) for field in fields):
+        raise ValueError('PCI resource mappings and mediated devices are not supported')
+    host = fields[0].removeprefix('host=')
+    addresses = host.lower().split(';')
+    if not addresses or any(not re.fullmatch(r'(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-1][0-9a-f](?:\.[0-7])?',
+                                            address) for address in addresses):
+        raise ValueError('Unsupported PCI address; expected a direct bus address')
+    return [address if address.count(':') == 2 else '0000:' + address for address in addresses]
+
+
+def validate_pci(config, sysfs=Path('/sys/bus/pci/devices')):
+    """Check every selected function before allowing hardware outside the archive."""
+    for key, value in config.items():
+        if not re.fullmatch(r'hostpci\d+', key):
+            continue
+        for address in pci_addresses(value):
+            devices = [sysfs / address] if '.' in address else sorted(sysfs.glob(address + '.*'))
+            if not devices:
+                raise ValueError(f'{key}: PCI device {address} is unavailable')
+            for device in devices:
+                try:
+                    class_code = int((device / 'class').read_text().strip(), 16)
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f'{key}: cannot identify PCI device {device.name}') from exc
+                if class_code >> 16 != 0x03 and class_code >> 8 != 0x0403:
+                    raise ValueError(f'{key}: PCI device {device.name} is not a display or HD-audio device; '
+                                     'its attached resources cannot be archived')
+
+
+def report_pci(config):
+    for key, value in config.items():
+        if re.fullmatch(r'hostpci\d+', key):
+            console.note(f'{key}: PCI passthrough configuration retained ({value}). '
+                         'Host hardware is not archived; review the assignment before starting a restored VM.')
 
 
 def report_media(media):
@@ -548,6 +591,8 @@ class Manager:
                 raise ValueError('Resume requires the stopped VM to retain its backup lock')
             cfg.pop('lock')
         external_media = safe_config(cfg)
+        validate_pci(cfg)
+        report_pci(cfg)
         report_media(external_media)
         if any(x.get('sid') == f'vm:{ident}' for x in self.api('/cluster/ha/resources')):
             raise ValueError('Remove this VM from HA management before archiving')
@@ -741,6 +786,7 @@ class Manager:
         if m.get('schema') == 3:
             return self.download_native(destination, m)
         report_media(m.get('external_media', {}))
+        report_pci(m.get('config', {}))
         if m.get('excluded_snapshots'):
             print('NOTICE: This archive does not contain the original snapshot history: '
                   + ', '.join(m['excluded_snapshots']), file=sys.stderr)
@@ -881,6 +927,8 @@ class Manager:
         else:
             raw = self.config_file(ident).read_text()
         sections = parse_native_config(raw)
+        for section in sections.values():
+            validate_pci(section)
         if set(sections) - {'current'} != set(snapshots):
             raise ValueError('Snapshot configuration changed during preflight')
         volumes = native_volumes(sections, ident)
@@ -993,6 +1041,7 @@ class Manager:
         sections = parse_native_config((stage / 'vm.conf').read_text())
         for section in sections.values():
             report_media(safe_config(section))
+            report_pci(section)
         volumes = native_volumes(sections, str(m['vmid']))
         if volumes != {d['device']: d['volume'] for d in m['disks']} or set(sections) - {'current'} != set(m['snapshots']):
             raise ValueError('Native manifest/configuration mismatch')
@@ -1097,7 +1146,8 @@ def parser():
     recovery.add_argument('--cleanup-local', action='store_true', help=argparse.SUPPRESS)
     to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM, verify, then delete VM',
         description='Shut down the source VM, select the archive format automatically, upload and verify, then delete it. '
-                    'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history.',
+                    'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history. '
+                    'Direct GPU/HD-audio passthrough is supported; host hardware is not archived.',
         epilog='Resume is only for a failed native LOCAL COPY before a manifest was created. '
                'Use the exact printed staging path, keep the VM stopped and backup-locked, and do not unlock first. '
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
@@ -1128,7 +1178,8 @@ def parser():
     r = sub.add_parser('restore', help='Restore latest complete backup by source VMID',
         description='Select the latest complete backup for --source and VMID. Restore to the original VMID/storage '
                     'unless overridden. Existing VMIDs are never overwritten. The restored VM stays stopped '
-                    'with onboot disabled; the cloud archive is retained.',
+                    'with onboot disabled; the cloud archive is retained. '
+                    'Review retained PCI passthrough assignments before starting the VM on the destination.',
         epilog='Run on the DESTINATION PVE but keep the ORIGINAL --source label. '
                '--unique changes MAC addresses, not guest static IPs. '
                'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100 --target-vmid 200 --storage destination-dir --unique. '

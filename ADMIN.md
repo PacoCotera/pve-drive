@@ -49,7 +49,9 @@ Native mode requires VM-owned standalone QCOW2 files on directory storage, with 
 
 Native copying reads bytes sequentially, preserves zero-filled regions as sparse output, flushes the destination, and checks SHA-256. It does not convert QCOW2 images or use reflinks/copy offloading.
 
-Preflight rejects protected/template VMs, unsupported locks, pending configuration, HA/replication membership, unused or excluded data disks, passthrough devices, physical CD-ROMs, custom QEMU arguments, hooks, and external cloud-init snippets. Backup locks are accepted only by the matching resume/recovery paths. Standard cloud-init drives are supported in VMA mode only. LXC and Proxmox Backup Server repositories are not supported.
+Preflight rejects protected/template VMs, unsupported locks, pending configuration, HA/replication membership, unused or excluded data disks, unsupported passthrough devices, physical CD-ROMs, custom QEMU arguments, hooks, and external cloud-init snippets. Backup locks are accepted only by the matching resume/recovery paths. Standard cloud-init drives are supported in VMA mode only. LXC and Proxmox Backup Server repositories are not supported.
+
+Direct PCI passthrough is supported for display controllers and HD-audio devices. Before archiving, the script checks each assigned PCI function against the source node's Linux device classes, including all functions selected by an address without a function suffix. Storage controllers, USB controllers, other device classes, missing devices, resource mappings, and mediated devices are rejected. Native snapshot sections receive the same checks. PCI assignments are preserved in the VM and snapshot configurations; physical hardware and its state are not archived. Review these assignments before starting or rolling back a restored VM, particularly on another node. `--unique` does not change PCI assignments.
 
 Storage ISO references are retained, but ISO contents are not archived. Reattach or eject unavailable media before starting a restored VM. Host bridges, storage definitions, firewall files, cluster permissions, HA settings, and other host resources are not packaged.
 

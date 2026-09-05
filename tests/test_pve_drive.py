@@ -138,7 +138,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_unbacked_resources_rejected(self):
         for config in [{'scsi0': 'pool:disk,backup=0'}, {'unused0': 'pool:disk'},
-                       {'hostpci0': '0000:01:00'}, {'args': '-drive secret'},
+                       {'hostpci0': 'mapping=gpu'}, {'args': '-drive secret'},
                        {'ide2': '/dev/cdrom,media=cdrom'}, {'scsi0': '/dev/sda'}]:
             with self.subTest(config=config), self.assertRaises(ValueError):
                 p.safe_config(config)
