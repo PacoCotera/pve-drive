@@ -17,20 +17,20 @@ uname -a >> environment.txt
 /usr/bin/time -v -o single32.time \
   pve-drive --remote gdrive:pve-archive --source pve-benchmark \
   --work-dir /mnt/backup-space/pve-drive-staging --verbose \
-  upload 100 --keep-vm --single-file --transfers 1 --drive-chunk-size 32M \
+  upload 100 --single-file --transfers 1 --drive-chunk-size 32M \
   > single32.log 2>&1
 
 # B: new default implementation, same VM and original QCOW2 bytes.
 /usr/bin/time -v -o multipart8.time \
   pve-drive --remote gdrive:pve-archive --source pve-benchmark \
   --work-dir /mnt/backup-space/pve-drive-staging --verbose \
-  upload 100 --keep-vm \
+  upload 100 \
   > multipart8.log 2>&1
 
 pve-drive --remote gdrive:pve-archive --source pve-benchmark list --all-versions
 ```
 
-These commands exercise the actual native upload implementation, including local preparation, hashing, parallel transfers, and verification. They create two distinct complete archives. If the test VM has no snapshots, use the advanced command `archive 100 --format native-qcow2 --keep-vm --cleanup-local` instead of `upload 100 --keep-vm` in both cases to force the same native comparison.
+These commands exercise the actual native upload implementation, including local preparation, hashing, parallel transfers, and verification. They create two distinct complete archives. If the test VM has no snapshots, use the advanced command `archive 100 --format native-qcow2 --cleanup-local` instead of `upload 100` in both cases to force the same native comparison.
 
 Each log includes timestamped rclone statistics. Record (1) transfer elapsed time and original bytes / transfer elapsed seconds / 1048576 for aggregate MiB/s; (2) end-to-end elapsed time from the `.time` file; (3) local split/copy and verification time; (4) peak RAM, disk read/write rates, CPU utilization, retries and quota errors. `iostat -xz 2`, `pidstat -dru 2`, and network interface counters in another terminal help distinguish disk, CPU, and network limits. `/usr/bin/time` RSS alone is not total simultaneous process-tree RAM; sample rclone and Python RSS during the transfer. A gigabit link has a raw ceiling of about 119 MiB/s before overhead.
 
@@ -68,13 +68,13 @@ This is the appropriate comparison when QCOW2 file lengths exceed local free spa
 # Previous compressed single-file stream; retain the VM.
 /usr/bin/time -v -o vma-single.time \
   pve-drive --remote gdrive:pve-archive --source pve-benchmark \
-  upload 100 --keep-vm --stream --single-file --drive-chunk-size 128M \
+  upload 100 --stream --single-file --drive-chunk-size 128M \
   > vma-single.log 2>&1
 
 # New normal command: compressed multipart, eight transfers, bounded spool.
 /usr/bin/time -v -o vma-multipart.time \
   pve-drive --remote gdrive:pve-archive --source pve-benchmark \
-  upload 100 --keep-vm > vma-multipart.log 2>&1
+  upload 100 > vma-multipart.log 2>&1
 ```
 
 Normal VMA upload needs only 3.25 GiB free for the default payload spool plus headroom, rather than the original QCOW2 lengths. Watch `du -sb /var/lib/vz/pve-drive/stream-100-*/spool` during transfer and a quota pause: the active spool should stay at or below 2.25 GiB. Logs and Proxmox temporary metadata are separate. The first upload starts after 256 MiB is produced; at least 2 GiB of compressed output is useful to exercise eight concurrent transfers. Smaller archives may finish before all workers become busy.

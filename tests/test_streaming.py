@@ -179,7 +179,6 @@ class StreamLifecycleTests(unittest.TestCase):
 
     def test_keep_vm(self):
         self.a.delete_vm = False
-        self.a.keep_vm = True
         self.execute()
         self.assertFalse(self.case.deleted)
         self.assertIn(['qm', 'unlock', '100'], self.case.commands)

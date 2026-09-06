@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.0
+
+- Retain source VMs by default; require explicit `--delete-vm`. Remove `--keep-vm`.
+- Add server-local timestamps, numbered step starts/completions, durations, and operation/source-policy explanations.
+- Combine native staging verification and MD5 collection into one pre-upload read-back; retain source and publication safety checks.
+- Update command examples, administrator documentation, and regression tests.
+
 ## 0.10.0
 
 - Automatically stream compressed VMA archives through parallel Drive uploads for VMs without snapshots, using a bounded 2.25 GiB default spool.

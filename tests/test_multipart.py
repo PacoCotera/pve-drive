@@ -88,7 +88,7 @@ class MultipartTests(unittest.TestCase):
 
     def archive(self, keep=True):
         self.a.delete_vm = not keep
-        self.a.keep_vm = keep
+        self.a.delete_vm = not keep
         self.m.archive()
         return json.loads(next(v for k, v in self.c.remote.items() if k.endswith('/manifest.json')))
 
@@ -125,6 +125,25 @@ class MultipartTests(unittest.TestCase):
         self.assertFalse(self.c.file('100').exists())
         self.assertEqual(self.calls[-1][1].split('/')[-1], 'COMPLETE')
 
+    def test_preupload_staging_is_verified_once_with_both_hashes(self):
+        with self.harness(), patch.object(p, 'check_parts', wraps=p.check_parts) as checks:
+            self.archive()
+        self.assertEqual(checks.call_count, 1)
+        self.assertTrue(checks.call_args.kwargs['collect_md5'])
+
+    def test_corrupt_staging_after_split_never_uploads_or_deletes(self):
+        original = p.split_native
+        def corrupt(*args, **kwargs):
+            record = original(*args, **kwargs)
+            path = args[1] / record['parts'][0]['filename']
+            data = path.read_bytes()
+            path.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+            return record
+        with self.harness(), patch.object(p, 'split_native', side_effect=corrupt), self.assertRaisesRegex(ValueError, 'checksum'):
+            self.archive(keep=False)
+        self.assertFalse(any(c[0] == 'copy' for c in self.calls))
+        self.assertTrue(self.c.file('100').exists())
+
     @unittest.skipUnless(shutil.which('rclone'), 'rclone unavailable')
     def test_real_rclone_multipart_lifecycle(self):
         self.a.remote = 'gdrive:' + str(self.c.root / 'remote')
@@ -139,7 +158,6 @@ class MultipartTests(unittest.TestCase):
             return self.c.fake_run(*args, **kwargs)
         with patch.object(p, 'run', run), patch.object(self.m, 'api', self.c.api), \
                 patch.object(self.m, 'config_file', self.c.file):
-            self.a.keep_vm = True
             self.a.delete_vm = False
             self.m.archive()
             manifest = json.loads((self.stage() / 'payload/manifest.json').read_text())

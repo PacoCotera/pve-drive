@@ -105,7 +105,6 @@ class LifecycleTests(unittest.TestCase):
 
     def test_keep_vm_does_not_destroy(self):
         self.args.delete_vm = False
-        self.args.keep_vm = True
         self.execute()
         self.assertFalse(self.deleted)
         self.assertIn(['qm', 'unlock', '100'], self.commands)
@@ -165,7 +164,6 @@ class LifecycleTests(unittest.TestCase):
 
     def test_keep_vm_with_snapshots_records_exclusion(self):
         self.args.delete_vm = False
-        self.args.keep_vm = True
         with patch.object(self, 'api', self.with_snapshots()):
             self.execute()
         self.assertFalse(self.deleted)

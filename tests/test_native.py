@@ -143,7 +143,6 @@ class NativeTests(unittest.TestCase):
 
     def test_native_keep_vm_preserves_original_snapshot_configuration(self):
         self.args.delete_vm = False
-        self.args.keep_vm = True
         with self.harness():
             self.archive()
         self.assertEqual(self.file('100').read_text(), CONFIG)
@@ -225,7 +224,6 @@ class NativeTests(unittest.TestCase):
     def test_resume_reuses_failed_copy_and_keeps_vm_when_requested(self):
         stage = self.failed_copy_stage()
         self.args.resume = str(stage)
-        self.args.keep_vm = True
         self.args.delete_vm = False
         self.args.cleanup_local = False
         with self.harness():
@@ -348,7 +346,7 @@ class NativeTests(unittest.TestCase):
         upload = p.parser().parse_args(base + ['upload', '100'])
         self.assertEqual(upload.vmid, '100')
         self.assertTrue(upload.cleanup_local)
-        self.assertFalse(upload.keep_vm)
+        self.assertFalse(upload.delete_vm)
         restore = p.parser().parse_args(base + ['restore', '100'])
         self.assertEqual(restore.backup_id, '100')
         self.assertIsNone(restore.vmid)

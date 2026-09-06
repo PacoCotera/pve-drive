@@ -10,6 +10,40 @@ import pve_drive as p
 
 
 class ProgressTests(unittest.TestCase):
+    def test_server_time_and_completion_duration_in_console_and_log(self):
+        c, stream = self.display()
+        from datetime import datetime
+        with patch.object(p, 'datetime') as clock, patch.object(p.time, 'monotonic', return_value=c.started + 12):
+            clock.now.return_value = datetime(2026, 9, 6, 16, 33, 29)
+            c.stage('Verifying parts')
+        with patch.object(p.time, 'monotonic', return_value=c.started + 72):
+            c.complete_stage()
+        self.assertIn('[2026-09-06 16:33:29 | elapsed 00:00:12] Step 1 started', stream.getvalue())
+        self.assertIn('Step 1 complete: Verifying parts (duration 00:01:00)', stream.getvalue())
+        self.assertIn('[2026-09-06 16:33:29', c.log.getvalue())
+        before = stream.getvalue()
+        c.complete_stage()
+        self.assertEqual(before, stream.getvalue())
+
+    def test_failed_step_is_not_reported_complete_when_retry_starts(self):
+        c, stream = self.display()
+        c.stage('Upload')
+        c.fail_stage()
+        c.stage('Retry upload')
+        self.assertIn('Step 1 interrupted or failed', stream.getvalue())
+        self.assertNotIn('Step 1 complete', stream.getvalue())
+        self.assertIn('Step 2 started', stream.getvalue())
+
+    def test_retention_default_and_explicit_deletion_for_both_commands(self):
+        base = ['--remote', 'gdrive:archive', '--source', 'test']
+        for command in ('upload', 'archive', 'move-to-cloud'):
+            args = p.parser().parse_args(base + [command, '100'])
+            self.assertFalse(args.delete_vm)
+            self.assertFalse(hasattr(args, 'keep_vm'))
+            self.assertTrue(p.parser().parse_args(base + [command, '100', '--delete-vm']).delete_vm)
+            with patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
+                p.parser().parse_args(base + [command, '100', '--keep-vm'])
+
     def display(self, tty=False):
         stream = io.StringIO()
         stream.isatty = lambda: tty

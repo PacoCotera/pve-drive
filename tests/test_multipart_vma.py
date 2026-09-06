@@ -159,7 +159,6 @@ class MultipartVmaLifecycleTests(unittest.TestCase):
         self.a.part_size = 7
         self.a.transfers = 2
         self.a.quota_retries = 0
-        self.a.keep_vm = True
         self.a.delete_vm = False
         self.data = b'compressed-fixture-data-across-multiple-parts'
         self.remote, self.calls, self.sent = {}, [], []
@@ -264,7 +263,7 @@ class MultipartVmaLifecycleTests(unittest.TestCase):
         self.assertEqual(space.call_args.args[1], 9 * 256 * 1024 ** 2 + 1024 ** 3)
 
     def test_delete_requires_all_parts_manifest_and_marker(self):
-        self.a.keep_vm = False
+        self.a.delete_vm = True
         with self.harness():
             self.m.move_to_cloud()
         self.assertTrue(self.c.deleted)
@@ -353,7 +352,7 @@ class MultipartVmaLifecycleTests(unittest.TestCase):
         self.assertFalse(self.c.deleted)
 
     def test_remote_corruption_before_publication_blocks_deletion(self):
-        self.a.keep_vm = False
+        self.a.delete_vm = True
         original = self.rc
         def corrupt(*args, **kwargs):
             if args[0] == 'copyto' and str(args[2]).endswith('/manifest.json'):

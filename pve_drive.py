@@ -20,7 +20,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.10.0'
+__version__ = '0.11.0'
 
 PART_SIZE = 4 * 1024 ** 3
 TRANSFERS = 8
@@ -44,7 +44,7 @@ def transfer_count(value):
     return count
 
 
-def split_native(source, payload, filename, size):
+def split_native(source, payload, filename, size, verify=True):
     """Copy exact bytes into independent parts; bounded memory, atomic part names."""
     before = file_details(source)
     if type(size) is not int or size <= 0 or before['size'] <= 0:
@@ -82,10 +82,13 @@ def split_native(source, payload, filename, size):
             raise ValueError('Source changed while splitting')
     record = {'filename': filename, 'size': before['size'], 'sha256': whole.hexdigest(),
               'part_size': size, 'parts': parts}
-    # Read staging back, including the whole-file digest, before any upload.
-    check_parts(payload, record)
-    if sha256(source) != record['sha256'] or file_details(source) != before:
-        raise ValueError('Source changed while splitting')
+    console.complete_stage()
+    # Standalone callers verify here. The upload path performs one combined
+    # SHA-256/MD5 read-back in finish_multipart before any transfer.
+    if verify:
+        check_parts(payload, record)
+        if sha256(source) != record['sha256'] or file_details(source) != before:
+            raise ValueError('Source changed while splitting')
     return record
 
 
@@ -106,7 +109,7 @@ def check_parts(directory, disk, target=None, collect_md5=False):
     whole = hashlib.sha256()
     total = 0
     checks = {}
-    console.stage('Reconstructing native disk' if target is not None else 'Verifying native archive')
+    console.stage(('Reconstructing and verifying ' if target is not None else 'Verifying staged parts and whole-file SHA-256: ') + disk.get('filename', 'archive payload'))
     with ExitStack() as stack:
         out = None
         if target is not None:
@@ -149,6 +152,7 @@ def check_parts(directory, disk, target=None, collect_md5=False):
         if temporary.stat().st_size != disk['size'] or sha256(temporary) != disk['sha256']:
             raise ValueError('Reconstructed whole-file checksum mismatch')
         temporary.replace(target)
+    console.complete_stage()
     return checks
 
 
@@ -178,6 +182,8 @@ class Console:
         self.phase = ''
         self.last = self.phase_started
         self.live = False
+        self.step = 0
+        self.active = False
 
     def record(self, text):
         if self.log:
@@ -190,18 +196,36 @@ class Console:
             self.stream.flush()
             self.live = False
 
+    def stamp(self, text):
+        return f'[{datetime.now():%Y-%m-%d %H:%M:%S} | elapsed {duration(time.monotonic() - self.started)}] {text}'
+
     def note(self, text):
-        self.record(text + '\n')
+        line = self.stamp(text)
+        self.record(line + '\n')
         if self.enabled:
             self.clear()
-            print(f'[{duration(time.monotonic() - self.started)}] {text}', file=self.stream, flush=True)
+            print(line, file=self.stream, flush=True)
+
+    def complete_stage(self):
+        if self.active:
+            self.active = False
+            self.note(f'Step {self.step} complete: {self.phase} '
+                      f'(duration {duration(time.monotonic() - self.phase_started)})')
 
     def stage(self, label):
+        self.complete_stage()
         self.clear()
+        self.step += 1
         self.phase = label
         self.phase_started = time.monotonic()
         self.last = self.phase_started
-        self.note(label)
+        self.active = True
+        self.note(f'Step {self.step} started: {label}')
+
+    def fail_stage(self):
+        if self.active:
+            self.active = False
+            self.note(f'Step {self.step} interrupted or failed: {self.phase}')
 
     def update(self, done=None, total=None, speed=None, elapsed=None, force=False, estimated=False):
         if not self.enabled:
@@ -243,9 +267,9 @@ class Console:
             self.stream.flush()
             self.live = True
         else:
-            print(text, file=self.stream, flush=True)
+            print(self.stamp(text), file=self.stream, flush=True)
         if force:
-            self.record(text + '\n')
+            self.record(self.stamp(text) + '\n')
 
     def command(self, args):
         text = '+ ' + ' '.join(args) + '\n'
@@ -289,7 +313,7 @@ def run(*args, capture=False, cancel_event=None, progress=True):
     elif args[:2] == ['qm', 'destroy']:
         label = 'Removing verified VM from Proxmox'
     elif args[:2] == ['qemu-img', 'check']:
-        label = 'Checking QCOW2 integrity'
+        label = f'Checking QCOW2 structure and internal snapshots: {Path(args[-1]).name}'
     rclone = args[0] == 'rclone' and '--use-json-log' in args
     if label:
         console.stage(label)
@@ -343,6 +367,8 @@ def run(*args, capture=False, cancel_event=None, progress=True):
                     f.seek(max(0, out_path.stat().st_size - 4000))
                     detail = f.read().decode(errors='replace').strip()
             raise RuntimeError(f'{args[0]} failed (exit {proc.returncode}): {detail}')
+        if label:
+            console.complete_stage()
         return out_path.read_text(errors='replace') if capture else None
 
 
@@ -698,7 +724,7 @@ def file_hash(path, algorithm='sha256', progress=True):
                 console.update(done, total)
     if show:
         console.update(done, total, force=True)
-        console.clear()
+        console.complete_stage()
     return (h.hexdigest(), md5.hexdigest()) if md5 is not None else h.hexdigest()
 
 
@@ -973,8 +999,16 @@ class Manager:
                 label = 'Uploading archive'
             console.stage(label)
             progress = ['--stats', '2s', '--stats-log-level', 'NOTICE', '--use-json-log']
-        return run('rclone', '--config', self.a.rclone_config,
-                   '--retries', '5', '--low-level-retries', '10', *args, *progress, capture=capture)
+        try:
+            result = run('rclone', '--config', self.a.rclone_config,
+                         '--retries', '5', '--low-level-retries', '10', *args, *progress, capture=capture)
+        except BaseException:
+            if progress:
+                console.fail_stage()
+            raise
+        if progress:
+            console.complete_stage()
+        return result
 
     def api(self, path):
         return json.loads(run('pvesh', 'get', path, '--output-format', 'json', capture=True))
@@ -1243,8 +1277,6 @@ class Manager:
             if attempts:
                 self.a.resume = str(attempts[0])
                 console.note(f'Resuming unfinished upload: {attempts[0]}')
-        if not self.a.delete_vm and not self.a.keep_vm:
-            raise ValueError('Choose --delete-vm or --keep-vm')
         cfg = self.config(ident)
         if getattr(self.a, 'resume', None):
             if cfg.get('lock') != 'backup':
@@ -1276,10 +1308,10 @@ class Manager:
             if self.a.delete_vm and not self.a.allow_snapshot_loss:
                 raise ValueError('VM has snapshots. Archive contains current state only; '
                                  'use --allow-snapshot-loss with --delete-vm to explicitly '
-                                 'accept deleting snapshot history, or use --keep-vm')
+                                 'accept deleting snapshot history, or omit --delete-vm')
             print('NOTICE: Archive contains current state only. Snapshots excluded: '
-                  + ', '.join(snapshot_names) + ('. Original snapshots remain with --keep-vm.'
-                  if self.a.keep_vm else '. Snapshot history will be deleted with the VM.'),
+                  + ', '.join(snapshot_names) + ('. Original snapshots remain on the retained VM.'
+                  if (not self.a.delete_vm) else '. Snapshot history will be deleted with the VM.'),
                   file=sys.stderr)
         # Fail before shutting down if the destination cannot be listed.
         self.rc('mkdir', self.base)
@@ -1969,7 +2001,6 @@ class Manager:
         return Path(f'/etc/pve/qemu-server/{ident}.conf')
 
     def move_to_cloud(self):
-        self.a.delete_vm = not self.a.keep_vm
         self.a.allow_snapshot_loss = False
         self.a.format = 'auto'
         self.archive()
@@ -2088,7 +2119,7 @@ class Manager:
             info = self.qcow_info(path, snapshots)
             dest = payload / (key + '.qcow2')
             if multipart:
-                record = split_native(path, payload, dest.name, (getattr(self.a, 'part_size', None) or PART_SIZE))
+                record = split_native(path, payload, dest.name, (getattr(self.a, 'part_size', None) or PART_SIZE), verify=False)
                 record['original_filename'] = path.name
                 expected_parts = {part['filename'] for part in record['parts']}
                 for previous in payload.glob(dest.name + '.part-*'):
@@ -2210,14 +2241,16 @@ class Manager:
         for d in m['disks']:
             local_checks.update(check_parts(payload, d, collect_md5=True))
         expected = dict(m['config'], lock='backup')
-        def source_check():
+        def source_check(reason):
+            console.note(reason + ': checking stopped/locked VM, configuration, and original disk SHA-256')
             self.unchanged(ident, expected.copy())
             if self.config_file(ident).read_text() != locked_raw:
                 raise ValueError('Snapshot configuration changed; refusing deletion')
             for d in m['disks']:
                 if sha256(sources[d['device']]) != d['sha256']:
                     raise ValueError('Original disk changed after archive; refusing deletion')
-        source_check()
+        source_check('Before upload')
+        console.note('Local verification complete; remaining: upload, remote verification, source recheck, publication, VM retention/deletion')
         manifest_path = payload / 'manifest.json'
         manifest_hash, manifest_md5 = file_hash(manifest_path, 'both')
         config_hash, config_md5 = file_hash(payload / 'vm.conf', 'both')
@@ -2242,7 +2275,7 @@ class Manager:
                 check_parts(payload, d)
         if self.rc('cat', destination + '/manifest.json', capture=True).encode() != manifest_path.read_bytes():
             raise ValueError('Cloud manifest read-back mismatch')
-        source_check()
+        source_check('Before publishing the verified archive')
         if any(file_details(payload / name) != state for name, state in states.items()) or sha256(manifest_path) != manifest_hash:
             raise ValueError('Multipart payload changed during upload')
         marker = stage / 'COMPLETE'
@@ -2252,7 +2285,7 @@ class Manager:
         if self.rc('cat', destination + '/COMPLETE', capture=True) != marker.read_text():
             raise ValueError('Completion marker verification failed')
         # A quota wait can span hours, even when publishing the marker.
-        source_check()
+        source_check('After completion-marker publication; final source safety check')
         if self.a.delete_vm:
             run('qm', 'destroy', ident, '--skiplock', '1', '--purge', '1')
             if any(str(x.get('vmid')) == ident for x in self.api('/cluster/resources')):
@@ -2431,10 +2464,10 @@ class Manager:
 def parser():
     p = argparse.ArgumentParser(prog='pve-drive',
         description='Move Proxmox QEMU VMs to/from cloud storage using rclone. '
-                    'Upload deletes the VM only after verification; use --keep-vm to test.',
+                    'Upload retains the stopped VM by default; --delete-vm explicitly removes it after verification.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Examples (global options go BEFORE the command):\n'
-               '  pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm\n'
+               '  pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100\n'
                '  pve-drive --remote gdrive:pve-archive --source pve-site-a list\n'
                '  pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100\n'
                '  pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100 --target-vmid 200 --storage destination-dir --unique\n\n'
@@ -2475,16 +2508,16 @@ def parser():
     recovery.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True,
                           help='Retain staging after successful recovery (default: remove it); failures retain files')
     recovery.add_argument('--cleanup-local', action='store_true', help=argparse.SUPPRESS)
-    to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive VM, verify, then delete VM',
-        description='Shut down the source VM, select the archive format automatically, upload and verify, then delete it. '
-                    'Use --keep-vm for a test. Unsupported snapshot layouts fail without silently discarding history. '
+    to = sub.add_parser('upload', aliases=['move-to-cloud'], help='Archive and verify VM; retain it unless --delete-vm is specified',
+        description='Shut down the source VM, select the archive format automatically, upload and verify, then retain it stopped. '
+                    'Use --delete-vm to explicitly remove it after verification. Unsupported snapshot layouts fail without silently discarding history. '
                     'Direct GPU/HD-audio passthrough is supported; host hardware is not archived. '
                     'VMs without snapshots use compressed multipart streaming with bounded staging automatically.',
         epilog='Multipart uploads resume completed parts after interruption or quota exhaustion. '
                'Use the exact printed staging path, keep the VM stopped and backup-locked, and do not unlock first. '
-               'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm')
+               'Example: pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE')
     to.add_argument('vmid', type=vmid)
-    to.add_argument('--keep-vm', action='store_true', help='Test upload without deleting the original VM')
+    to.add_argument('--delete-vm', action='store_true', help='Delete the source VM and disks only after successful verification (default: retain stopped)')
     to.add_argument('--stream', action='store_true', help='Explicitly select compressed multipart VMA streaming (already automatic without snapshots); bounded staging, parallel uploads and quota retries. With --single-file, use the legacy unspooled stream')
     to.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'],
                     help='Drive upload chunk size (multipart default: 128M; legacy single-file stream: 32M); buffered per transfer')
@@ -2501,9 +2534,7 @@ def parser():
     a = sub.add_parser('archive', help='Advanced: select archive format and deletion policy explicitly')
     a.add_argument('vmid', type=vmid)
     a.add_argument('--deep-verify', action='store_true', help='Download upload again to verify it (default: cloud size and MD5 comparison)')
-    g = a.add_mutually_exclusive_group(required=True)
-    g.add_argument('--delete-vm', action='store_true')
-    g.add_argument('--keep-vm', action='store_true')
+    a.add_argument('--delete-vm', action='store_true', help='Delete the source VM after successful verification (default: retain stopped)')
     a.add_argument('--shutdown-timeout', type=int, default=300)
     a.add_argument('--format', choices=['vzdump', 'native-qcow2'], default='vzdump',
                    help='native-qcow2 preserves internal disk snapshots on directory storage')
@@ -2577,6 +2608,9 @@ def main():
     console.enabled = True
     console.note(f'pve-drive {__version__} | {args.command} | source {args.source or "legacy"}')
     console.note(f'Log: {log_path}')
+    if args.command in ('upload', 'move-to-cloud', 'archive'):
+        console.note('Plan: preflight → stop VM → prepare and verify → upload → verify remote and source → publish → finish')
+        console.note('Source VM policy: ' + ('DELETE after successful verification (--delete-vm).' if args.delete_vm else 'retain stopped (default).'))
     console.stage('Checking prerequisites')
     # One operation per node, regardless of work directory or destination.
     with open('/run/lock/pve-drive.lock', 'w') as lock:
@@ -2588,6 +2622,7 @@ def main():
         else:
             method = {'list': 'listing', 'upload': 'move_to_cloud'}.get(args.command, args.command.replace('-', '_'))
             getattr(manager, method)()
+    console.complete_stage()
     console.note('Complete')
 
 
@@ -2595,6 +2630,7 @@ if __name__ == '__main__':
     try:
         main()
     except (Exception, KeyboardInterrupt) as exc:
+        console.fail_stage()
         console.clear()
         console.record(f'ERROR: {exc}\n')
         print(f'ERROR: {exc}\nIf failure occurred during preflight, no VM changes were made. '

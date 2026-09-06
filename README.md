@@ -12,19 +12,19 @@ pve-drive takes care of shutting down, archiving, verifying, and restoring Proxm
 - **Wait out Google Drive upload quotas.** Recognized quota blocks retry hourly, up to 24 times by default. Streaming production pauses when the spool fills and continues when uploads can proceed. Retained recovery data lets eligible interrupted uploads and downloads resume.
 - **Keep supported QCOW2 snapshots intact.** VMs with supported internal snapshots use native archives that preserve exact QCOW2 bytes and Proxmox snapshot configuration. No disk conversion is involved.
 - **Keep administration focused on VMs.** Upload, list, and restore by VMID. Archives are organized by source node label and VMID, and incomplete attempts stay out of the complete-backup listing. Guarded cleanup removes abandoned attempts.
-- **Restore where you need the VM.** Choose another node, an unused VMID, or destination storage. Retain the source with `--keep-vm`, or reclaim its disks only after successful archive verification.
+- **Restore where you need the VM.** Choose another node, an unused VMID, or destination storage. Keep the source by default, or explicitly reclaim its disks with `--delete-vm` after successful archive verification.
 
 ## Three everyday commands
 
 After installation and remote configuration:
 
 ```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100
 pve-drive --remote gdrive:pve-archive --source pve-site-a list
 pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100
 ```
 
-`--source` identifies the originating PVE node; keep that label when restoring elsewhere. Upload stops the VM. **Keep `--keep-vm` to retain the source; omitting it deletes the VM and its disks after successful verification.** Restore requires an unused destination VMID and leaves the restored VM stopped.
+`--source` identifies the originating PVE node; keep that label when restoring elsewhere. Upload stops the VM. **The source VM and disks are retained by default. Add `--delete-vm` only when you want them removed after successful verification.** Restore requires an unused destination VMID and leaves the restored VM stopped.
 
 ## The right archive for the VM
 
@@ -41,7 +41,7 @@ Quota recovery keeps the same VMA stream only while its producer remains alive. 
 
 Throughput depends on the host, compression, network, and Drive. The [benchmark guide](BENCHMARK.md) provides a reproducible comparison with single-file uploads. Transfer and part tuning are available under `upload --help` and `restore --help`; routine use needs no extra switches.
 
-**Status: experimental.** Validate upload, restore, and snapshot rollback with `--keep-vm` before enabling source VM deletion.
+**Status: experimental.** Validate upload, restore, and snapshot rollback before using `--delete-vm`.
 
 ## Installation
 
@@ -81,7 +81,7 @@ Uppercase terms represent argument values. Square brackets denote optional synta
 Create and verify an archive while retaining the source VM:
 
 ```bash
-pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100 --keep-vm
+pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100
 ```
 
 The example archives VM `100` to `gdrive:pve-archive` under source identifier `pve-site-a`. The source VM is shut down before archiving and retained in a stopped state after verification.
@@ -92,9 +92,9 @@ The example archives VM `100` to `gdrive:pve-archive` under source identifier `p
 | `--source pve-site-a` | Persistent identifier for the source node. Use the same identifier for listing and restoration, including restoration on another node. |
 | `upload` | Archive and verify the VM. Execute on the node that owns the source VM. |
 | `100` | Proxmox ID of the source VM. |
-| `--keep-vm` | Retain the source VM and its disks after verification. The VM remains stopped. |
+| `--delete-vm` | Optional: delete the source VM and disks after all verification succeeds. Omit to retain them stopped. |
 
-**Without `--keep-vm`, a successful upload deletes the source VM and its disks after verification.**
+**Upload retains the source VM by default. To explicitly archive and remove it, use `upload 100 --delete-vm`.**
 
 VMs without snapshots automatically use compressed VMA streaming with parallel Google Drive uploads. The default upload spool is bounded to 2.25 GiB, with 1 GiB of additional free-space headroom required; it does not stage the VM's full QCOW2 files. No `--stream` option is needed.
 
@@ -149,6 +149,19 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a cleanup 100 --apply
 ```
 
 `cleanup VMID` finds recorded upload attempts for the selected source and previews removal. `--apply` discards their local recovery files and recorded incomplete cloud uploads. Completed cloud archives, VM disks, locks, and diagnostic logs are retained. Use the matching `--work-dir` for staging on another filesystem. Run cleanup after active tasks finish. Advanced: `--stage PATH` selects one attempt, including restore staging or older directories without source records.
+
+## Progress you can follow
+
+Console messages use the server's local date and time directly, alongside total elapsed time. Each numbered step reports its start and completion, including its duration. Long disk reads show byte progress, speed, and ETA; the operation plan and source-retention policy are printed at startup.
+
+```text
+[2026-09-06 16:33:29 | elapsed 00:39:50] Step 4 started: Verifying staged parts and whole-file SHA-256: scsi0.qcow2
+[2026-09-06 16:49:10 | elapsed 00:55:31] Step 4 complete: Verifying staged parts and whole-file SHA-256: scsi0.qcow2 (duration 00:15:41)
+```
+
+Step counts depend on the disks, archive format, and retries. Repeated source checks explain their purpose: before upload, before archive publication, and after publishing the completion marker. The normal native upload combines staging SHA-256 and MD5 verification in one read-back pass.
+
+**Upgrading from 0.10.0:** remove `--keep-vm` from commands and automation; it is no longer accepted. Add `--delete-vm` only to jobs that should remove the source. Update after active operations finish.
 
 ## Operational notes
 

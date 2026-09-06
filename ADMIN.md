@@ -2,6 +2,12 @@
 
 For installation and everyday commands, see [README.md](README.md).
 
+## VM retention and progress
+
+Upload and advanced archive retain the source VM stopped by default. Only `--delete-vm` enables deletion after verification. The old retention flag is removed; update automation when upgrading.
+
+Console step starts and completions include the server-local date/time, total elapsed time, and completed step duration. No timezone conversion is performed. The initial plan shows remaining phases; disk checks explain whether they validate staged bytes or recheck the source before publication. Native upload uses one combined SHA-256/MD5 staging read-back before transfer; resumed attempts always validate retained data again.
+
 ## Source identity and archive selection
 
 Run uploads on the VM's owning node. Use a unique, stable `--source` label for each server; the tool does not enforce label ownership or connect to other nodes over SSH. A migrated VM may have older archives under its previous label.
@@ -82,7 +88,7 @@ The source stays under vzdump's backup lock during production, including quota w
 
 Normal `restore VMID` downloads schema 5 compressed parts in parallel, reconstructs the compressed VMA, verifies every part plus the complete reconstructed file, and runs `zstd --test` before `qmrestore`. Restore staging needs twice the **compressed** archive size plus 1 GiB; destination VM storage is separate. `restore ... --resume PATH` reuses SHA-256-verified downloads after interruption. New multipart VMA archives require 0.10.0 or newer on the restore node. All schema 1-4 archives remain supported. `--stream` restore remains a legacy single-file option.
 
-For throughput comparisons, `upload VMID --stream --single-file --keep-vm` selects the old single-file VMA stream. Advanced `archive --format vzdump` retains the old full-staging path unless `--stream` is selected. Routine administration does not need either option.
+For throughput comparisons, `upload VMID --stream --single-file` selects the old single-file VMA stream. Advanced `archive --format vzdump` retains the old full-staging path unless `--stream` is selected. Routine administration does not need either option.
 
 ## Legacy single-file streaming upload and restore
 
@@ -152,7 +158,7 @@ For an independent read of stored bytes, or a remote without MD5, select full re
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \
-  upload 100 --keep-vm --deep-verify
+  upload 100 --deep-verify
 ```
 
 Local copy checks, manifest checks, and restore SHA-256 checks remain required. Standalone `verify BACKUP_ID` always downloads and validates SHA-256. Checksums establish file integrity, not guest/application health. The completion marker is not a signature; restrict remote write access. Remote immutability is a tool convention, not a Drive permission guarantee.
@@ -165,7 +171,7 @@ First confirm the original operation has stopped. Inspect its log, staging path,
 
 ```bash
 pve-drive --remote gdrive:pve-archive --source pve-site-a \
-  upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE --keep-vm
+  upload 100 --resume /var/lib/vz/pve-drive/native-100-EXAMPLE
 ```
 
 Use the exact printed staging path. The original VM must remain stopped and backup-locked, with matching full configuration. This replaces failed local copies in the same staging directory and continues normal upload checks. Legacy stages with a manifest require `recover`; multipart stages with a manifest resume remote transfer and verification. Legacy local copy failures retain `copy-mismatch.json`; multipart failures retain the parts and diagnostic log. Checksum failures cannot be bypassed.
@@ -193,7 +199,7 @@ If only final cleanup failed, the operation may already have succeeded. Inspect 
 
 Progress shows elapsed time, percentage, speed, and ETA when measurable. Each run prints its log path under `/var/log/pve-drive/`. Logs are retained and may include VM configuration and paths; review before sharing. Add `--verbose` before the command to display raw commands and tool output.
 
-Advanced `archive` selects a format explicitly and requires `--keep-vm` or `--delete-vm`. VMA does not preserve snapshots; deleting a snapshotted VM in that mode requires explicit `--allow-snapshot-loss`. Routine `upload` never enables that flag.
+Advanced `archive` selects a format explicitly and retains the source by default; `--delete-vm` explicitly requests removal after verification. VMA does not preserve snapshots; deleting a snapshotted VM in that mode requires explicit `--allow-snapshot-loss`. Routine `upload` never enables that flag.
 
 Use `list --all-versions` to select a specific archive:
 
