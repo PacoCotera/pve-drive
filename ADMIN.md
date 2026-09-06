@@ -2,6 +2,16 @@
 
 For installation and everyday commands, see [README.md](README.md).
 
+## Interactive mode and existing backup stores
+
+Run `pve-drive` in a terminal for setup and menus, or append `interactive` to the usual remote/source options. Menus discover VMs, backup stores, existing local files, and cloud archives. The command shown in each action summary runs through the same implementation and operation lock as direct CLI use. The lock is not held while waiting at a menu. Batch items run sequentially; failures stop the remaining batch. Destructive actions require explicit selection and typing `DELETE`.
+
+`backups stores` discovers filesystem stores via PVE. `backups list` combines local/cloud inventories and `backups upload` transfers existing files without producing another backup. `backups download --storage auto` prefers the original usable store, otherwise the one with most free space. Direct commands never prompt; without `--storage`, ambiguous choices fail. The menu offers numbered destination choices. Explicit `--storage ID` is always available.
+
+`backups upload --delete-local` removes the source file only after verification and a fresh protection/source check. Protected backups may be copied but not moved. Downloading does not create a VM. Existing destination files are never overwritten. Use `backups cleanup` to discover/preview abandoned library attempts; ordinary `cleanup` continues to manage VM-archive attempts.
+
+See [BACKUP_FILES.md](BACKUP_FILES.md) for archive format, supported file types, bounded staging, destination requirements, quota recovery, notes/protection metadata, and scheduling considerations.
+
 ## VM retention and progress
 
 Upload and advanced archive retain the source VM stopped by default. Only `--delete-vm` enables deletion after verification. The old retention flag is removed; update automation when upgrading.
@@ -142,7 +152,7 @@ Native mode requires VM-owned standalone QCOW2 files on directory storage, with 
 
 Native copying reads bytes sequentially, preserves zero-filled regions as sparse output, flushes the destination, and checks SHA-256. It does not convert QCOW2 images or use reflinks/copy offloading.
 
-Preflight rejects protected/template VMs, unsupported locks, pending configuration, HA/replication membership, unused or excluded data disks, unsupported passthrough devices, physical CD-ROMs, custom QEMU arguments, hooks, and external cloud-init snippets. Backup locks are accepted only by the matching resume/recovery paths. Standard cloud-init drives are supported in VMA mode only. LXC and Proxmox Backup Server repositories are not supported.
+Preflight rejects protected/template VMs, unsupported locks, pending configuration, HA/replication membership, unused or excluded data disks, unsupported passthrough devices, physical CD-ROMs, custom QEMU arguments, hooks, and external cloud-init snippets. Backup locks are accepted only by the matching resume/recovery paths. Standard cloud-init drives are supported in VMA mode only. LXC lifecycle operations and Proxmox Backup Server repositories are not supported. The separate `backups` commands can transport existing LXC/OpenVZ tar backup files without restoring containers.
 
 Direct PCI passthrough is supported for display controllers and HD-audio devices. Before archiving, the script checks each assigned PCI function against the source node's Linux device classes, including all functions selected by an address without a function suffix. Storage controllers, USB controllers, other device classes, missing devices, resource mappings, and mediated devices are rejected. Native snapshot sections receive the same checks. PCI assignments are preserved in the VM and snapshot configurations; physical hardware and its state are not archived. Review these assignments before starting or rolling back a restored VM, particularly on another node. `--unique` does not change PCI assignments.
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Archive stopped Proxmox QEMU VMs to rclone; restore verified archives."""
 import argparse
+import base64
 import hashlib
 import json
 import math
@@ -16,11 +17,12 @@ import time
 import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait, FIRST_COMPLETED
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.11.0'
+__version__ = '0.12.0'
 
 PART_SIZE = 4 * 1024 ** 3
 TRANSFERS = 8
@@ -2461,12 +2463,570 @@ class Manager:
         console.note(f'Native VM {ident} restored, stopped, onboot disabled; snapshots: {m["snapshots"]}. Cloud archive retained.')
 
 
+def backup_filename(name):
+    if not isinstance(name, str):
+        raise ValueError('Invalid backup filename')
+    match = re.fullmatch(r'vzdump-(qemu|lxc|openvz)-([1-9][0-9]{2,8})-[A-Za-z0-9_-]+\.(vma|tar)(?:\.(?:zst|gz|lzo|bz2))?', name)
+    if not match or (match[1] == 'qemu') != (match[3] == 'vma'):
+        raise ValueError('Unsupported backup filename: ' + str(name))
+    return int(match[2])
+
+
+def library_id(value):
+    store, sep, rest = value.partition('/')
+    if not sep:
+        raise ValueError('Use a cloud backup ID printed by backups list')
+    source_name(store)
+    backup_id(rest)
+    return value
+
+
+def choose_rows(title, rows, label, multiple=False, default=None):
+    """Terminal-only selection. Empty input cancels unless a default is shown."""
+    if not sys.stdin.isatty():
+        raise ValueError('Selection requires a terminal; supply explicit command arguments')
+    if not rows:
+        console.note('No matching items')
+        return [] if multiple else None
+    print(title)
+    for index, row in enumerate(rows, 1):
+        print(f'{index}. {label(row)}' + (' — recommended' if index == default else ''))
+    while True:
+        answer = input('Choose numbers separated by commas (Enter cancels): ' if multiple else
+                       f'Choose [{default or "Enter cancels"}]: ').strip()
+        if not answer:
+            return [rows[default - 1]] if multiple and default else rows[default - 1] if default else [] if multiple else None
+        try:
+            indices = [int(x.strip()) for x in answer.split(',')]
+            if (not multiple and len(indices) != 1) or any(x < 1 or x > len(rows) for x in indices):
+                raise ValueError()
+            selected = [rows[x - 1] for x in dict.fromkeys(indices)]
+            return selected if multiple else selected[0]
+        except ValueError:
+            print('Enter one of the listed numbers.' if not multiple else 'Enter listed numbers separated by commas.')
+
+
+class BackupLibrary(Manager):
+    """Transport existing PVE backup files; never invokes VM lifecycle commands."""
+    def __init__(self, args):
+        super().__init__(args)
+        if not args.source:
+            raise ValueError('Backup-file operations require --source')
+        self.base = args.remote.rstrip('/') + '/backup-files/' + source_name(args.source)
+        self.node = Path('/etc/pve/local').resolve().name
+
+    def stores(self):
+        result = []
+        for row in self.api(f'/nodes/{self.node}/storage'):
+            if 'backup' not in row.get('content', '').split(','):
+                continue
+            name = source_name(row['storage'])
+            store = dict(row, storage=name, suitable=False, reason='unavailable or disabled')
+            if row.get('enabled', 1) and row.get('active'):
+                if row.get('type') == 'pbs':
+                    store['reason'] = 'PBS datastore: not a filesystem backup store'
+                else:
+                    try:
+                        probe = f'{name}:backup/vzdump-qemu-100-2000_01_01-00_00_00.vma.zst'
+                        resolved_probe = Path(run('pvesm', 'path', probe, capture=True).strip())
+                        if not resolved_probe.is_absolute() or resolved_probe.name != probe.split('/')[-1]:
+                            raise ValueError('Invalid storage path returned by Proxmox')
+                        directory = resolved_probe.parent.resolve(strict=True)
+                        if not directory.is_dir():
+                            raise ValueError('Not a directory')
+                        store.update(directory=str(directory), free=min(int(row.get('avail', 0)), shutil.disk_usage(directory).free),
+                                     writable=os.access(directory, os.W_OK), suitable=True, reason='')
+                    except (ValueError, OSError, RuntimeError) as error:
+                        store['reason'] = str(error)
+            result.append(store)
+        return sorted(result, key=lambda x: x['storage'])
+
+    def idle(self):
+        tasks = json.loads(run('pvesh', 'get', f'/nodes/{self.node}/tasks', '--source', 'active',
+                               '--typefilter', 'vzdump', '--limit', '1', '--output-format', 'json', capture=True))
+        if tasks:
+            raise ValueError('A Proxmox backup task is active; retry after it finishes')
+
+    def local(self):
+        result = []
+        for store in self.stores():
+            if not store['suitable']:
+                console.note(f"Skipping store {store['storage']}: {store['reason']}")
+                continue
+            try:
+                rows = self.api(f"/nodes/{self.node}/storage/{store['storage']}/content")
+                for row in rows:
+                    volume = row.get('volid', '')
+                    if row.get('content') != 'backup' and ':backup/' not in volume:
+                        continue
+                    name = volume.split(':backup/', 1)[-1]
+                    try:
+                        ident = backup_filename(name)
+                    except ValueError:
+                        console.note(f'Skipping unsupported/incomplete backup: {volume}')
+                        continue
+                    if volume != store['storage'] + ':backup/' + name:
+                        raise ValueError('Backup volume/store mismatch')
+                    path = Path(run('pvesm', 'path', volume, capture=True).strip())
+                    if not path.is_absolute() or path.name != name or path.is_symlink() or not path.is_file() or path.resolve().parent != Path(store['directory']):
+                        raise ValueError('Backup path is not a regular file in its discovered store')
+                    result.append(dict(row, volid=volume, filename=name, vmid=ident, storage=store['storage'],
+                                       path=str(path.resolve()), size=path.stat().st_size,
+                                       protected=bool(row.get('protected') or Path(str(path) + '.protected').exists())))
+            except (ValueError, RuntimeError, OSError) as error:
+                console.note(f"Cannot list store {store['storage']}: {error}")
+        return result
+
+    def sidecars(self, path):
+        names = [path.name + '.notes', path.name + '.protected',
+                 re.sub(r'\.(vma|tar)(?:\.(zst|gz|lzo|bz2))?$', '.log', path.name)]
+        result = {}
+        for name in names:
+            item = path.parent / name
+            if item.is_symlink():
+                raise ValueError('Backup sidecar is a symlink')
+            if item.exists():
+                if not item.is_file() or item.stat().st_size > 4 * 1024 ** 2:
+                    raise ValueError('Backup sidecar is not a regular file below 4 MiB')
+                result[name] = base64.b64encode(item.read_bytes()).decode('ascii')
+        return result
+
+    def validate_file_manifest(self, m, bid):
+        library_id(bid)
+        if (m.get('schema') != 1 or m.get('format') != 'pve-backup-file'
+                or m.get('transport') != {'format': 'pve-drive-parts', 'version': 1}
+                or m.get('backup_id') != bid or m.get('source') != self.a.source
+                or m.get('storage') != bid.split('/')[0]
+                or type(m.get('vmid')) is not int or str(m['vmid']) != bid.split('/')[1]
+                or backup_filename(m.get('filename', '')) != m['vmid']
+                or m.get('original_volume') != m['storage'] + ':backup/' + m['filename']
+                or not isinstance(m.get('source_node'), str) or not m['source_node']):
+            raise ValueError('Invalid backup-file identity/format')
+        size, width, parts = m.get('size'), m.get('part_size'), m.get('parts')
+        if (type(size) is not int or size <= 0 or type(width) is not int or width <= 0
+                or not isinstance(parts, list) or len(parts) != (size + width - 1) // width
+                or not re.fullmatch('[a-f0-9]{64}', str(m.get('sha256', '')))):
+            raise ValueError('Invalid backup-file sizes/checksum')
+        for i, part in enumerate(parts):
+            if (part.get('filename') != f'part-{i:06d}' or type(part.get('size')) is not int
+                    or part['size'] != min(width, size - i * width)
+                    or not re.fullmatch('[a-f0-9]{64}', str(part.get('sha256', '')))
+                    or not re.fullmatch('[a-f0-9]{32}', str(part.get('md5', '')))):
+                raise ValueError('Invalid backup-file part ordering/size/checksum')
+        if type(m.get('protected')) is not bool or not isinstance(m.get('sidecars'), dict):
+            raise ValueError('Invalid backup-file metadata')
+        allowed = {m['filename'] + '.notes', m['filename'] + '.protected',
+                   re.sub(r'\.(vma|tar)(?:\.(zst|gz|lzo|bz2))?$', '.log', m['filename'])}
+        for name, data in m['sidecars'].items():
+            if name not in allowed or not isinstance(data, str) or len(data) > 6 * 1024 ** 2:
+                raise ValueError('Invalid backup sidecar')
+            base64.b64decode(data, validate=True)
+        if m['protected'] and m['filename'] + '.protected' not in m['sidecars']:
+            raise ValueError('Protected backup missing protection metadata')
+
+    def file_manifest(self, bid):
+        library_id(bid)
+        destination = self.base + '/' + bid
+        raw = self.rc('cat', destination + '/manifest.json', capture=True).encode('utf-8')
+        marker = self.rc('cat', destination + '/COMPLETE', capture=True)
+        if marker != hashlib.sha256(raw).hexdigest() + '\n':
+            raise ValueError('Backup-file manifest completion checksum mismatch')
+        m = json.loads(raw)
+        self.validate_file_manifest(m, bid)
+        return m
+
+    def cloud(self):
+        # List the configured root so a first use with no library is not an error.
+        root = self.a.remote.rstrip('/')
+        prefix = 'backup-files/' + self.a.source + '/'
+        rows = json.loads(self.rc('lsjson', root, '--recursive', '--files-only', capture=True))
+        result = []
+        for row in rows:
+            path = row['Path']
+            if path.startswith(prefix) and path.endswith('/COMPLETE'):
+                result.append(self.file_manifest(path[len(prefix):-9]))
+        return sorted(result, key=lambda x: x['backup_id'])
+
+    def listing_files(self):
+        location = getattr(self.a, 'location', 'all')
+        locals_ = self.local() if location != 'cloud' else []
+        clouds = self.cloud() if location != 'local' else []
+        print('LOCATION  STORE  VMID  SIZE  PROTECTED  BACKUP / ID')
+        for row in locals_:
+            # Matching names/sizes are candidates, not proof of equal bytes.
+            if any(x['filename'] == row['filename'] and x['size'] == row['size'] for x in clouds):
+                continue
+            print(f"local  {row['storage']}  {row['vmid']}  {human_bytes(row['size'])}  {row['protected']}  {row['volid']}")
+        for row in clouds:
+            matches = [x['storage'] for x in locals_ if x['filename'] == row['filename'] and x['size'] == row['size']]
+            hint = ' (local stores: ' + ', '.join(matches) + '; filename/size match, not checksum-verified)' if matches else ''
+            print(f"{'both*' if matches else 'cloud'}  {row['storage']}  {row['vmid']}  {human_bytes(row['size'])}  {row['protected']}  {row['filename']}  {row['backup_id']}{hint}")
+        return locals_, clouds
+
+    def select_store(self, m):
+        requested = getattr(self.a, 'storage', None)
+        key = hashlib.sha256((self.base + '/' + m['backup_id']).encode()).hexdigest()[:24]
+        stores = []
+        for store in self.stores():
+            if not store['suitable'] or not store.get('writable'):
+                continue
+            stage = Path(store['directory']) / ('.pve-drive-' + key)
+            existing = 0
+            if stage.is_dir() and not stage.is_symlink():
+                record = stage / 'download.json'
+                if (record.is_file() and not record.is_symlink()
+                        and json.loads(record.read_text()).get('manifest') == m):
+                    expected = {stage / 'parts' / part['filename']: part['size'] for part in m['parts']}
+                    expected[stage / m['filename']] = m['size']
+                    existing = sum(size for path, size in expected.items()
+                                   if path.is_file() and not path.is_symlink() and path.stat().st_size == size)
+                    partial = stage / (m['filename'] + '.partial')
+                    if partial.is_file() and not partial.is_symlink():
+                        existing += min(m['size'], partial.stat().st_size)
+            if store['free'] >= max(0, 2 * m['size'] - existing) + 1024 ** 3:
+                stores.append(store)
+        if requested and requested != 'auto':
+            stores = [x for x in stores if x['storage'] == requested]
+            if not stores:
+                raise ValueError('Selected store is unavailable, not writable, or lacks space for parts and reconstruction')
+            return stores[0]
+        if not stores:
+            raise ValueError('No backup store has space for downloaded parts and reconstruction')
+        stores.sort(key=lambda x: (x['storage'] != m['storage'], -x['free'], x['storage']))
+        if getattr(self.a, 'interactive', False) and len(stores) > 1:
+            return choose_rows('Destination backup store', stores,
+                               lambda x: f"{x['storage']}  {x['directory']}  {human_bytes(x['free'])} free", default=1)
+        if stores[0]['storage'] == m['storage'] or len(stores) == 1 or requested == 'auto':
+            return stores[0]
+        raise ValueError('Several suitable stores; use --storage auto or an explicit storage ID')
+
+    def parallel(self, items, operation, total):
+        cancel = threading.Event()
+        done = 0
+        with ThreadPoolExecutor(max_workers=self.a.transfers) as pool:
+            pending = set()
+            remaining = iter(items)
+            try:
+                while True:
+                    while len(pending) < self.a.transfers:
+                        item = next(remaining, None)
+                        if item is None:
+                            break
+                        pending.add(pool.submit(operation, item, cancel))
+                    if not pending:
+                        break
+                    finished, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        done += future.result()
+                    console.update(done, total)
+            except BaseException:
+                cancel.set()
+                for future in pending:
+                    future.cancel()
+                raise
+        console.update(done, total, force=True)
+        console.complete_stage()
+
+    def scan_file(self, path, width):
+        before = file_details(path)
+        parts, whole, count = [], hashlib.sha256(), 0
+        console.stage('Reading existing backup: computing whole-file and part checksums')
+        with path.open('rb') as stream:
+            while count < before['size']:
+                sha, md5, length = hashlib.sha256(), hashlib.md5(usedforsecurity=False), 0
+                while length < min(width, before['size'] - count):
+                    block = stream.read(min(8 * 1024 ** 2, width - length, before['size'] - count - length))
+                    if not block:
+                        raise ValueError('Backup truncated during checksum scan')
+                    sha.update(block); md5.update(block); whole.update(block)
+                    length += len(block)
+                    console.update(count + length, before['size'])
+                parts.append(dict(filename=f'part-{len(parts):06d}', size=length, sha256=sha.hexdigest(), md5=md5.hexdigest()))
+                count += length
+        if not count or path.is_symlink() or file_details(path) != before:
+            raise ValueError('Backup changed during checksum scan')
+        console.complete_stage()
+        return before, parts, whole.hexdigest()
+
+    def remote_parts(self, destination, m, allow_missing=False):
+        rows = json.loads(self.rc('lsjson', destination, '--files-only', '--hash', capture=True))
+        expected = {p['filename']: p for p in m['parts']}
+        verified, names = set(), set()
+        for row in rows:
+            name = row['Path']
+            if name in names or name not in set(expected) | {'manifest.json', 'COMPLETE'}:
+                raise ValueError('Unexpected or duplicate cloud backup file')
+            names.add(name)
+            if name in expected:
+                part = expected[name]
+                if (row.get('Size') != part['size'] or
+                        {k.lower(): v.lower() for k, v in row.get('Hashes', {}).items()}.get('md5') != part['md5']):
+                    raise ValueError('Cloud backup part size/MD5 mismatch')
+                verified.add(name)
+        if not allow_missing and verified != set(expected):
+            raise ValueError('Missing cloud backup parts')
+        return verified
+
+    def upload_file(self, selector):
+        self.idle()
+        matches = [r for r in self.local() if selector in (r['volid'], r['filename'])]
+        if len(matches) != 1:
+            raise ValueError('Select one unambiguous local backup volume from backups list')
+        row = matches[0]
+        path = Path(row['path'])
+        if getattr(self.a, 'delete_local', False) and row['protected']:
+            raise ValueError('Protected backups may be copied but cannot be moved/deleted')
+        sidecars = self.sidecars(path)
+        original_sidecars = dict(sidecars)
+        if row['protected']:
+            sidecars.setdefault(path.name + '.protected', '')
+        initial = file_details(path)
+        self.work.mkdir(parents=True, exist_ok=True)
+        found = []
+        for stage in self.work.glob('backup-file-*'):
+            receipt = stage / 'upload.json'
+            if stage.is_symlink() or receipt.is_symlink() or not receipt.is_file():
+                continue
+            state = json.loads(receipt.read_text())
+            if state.get('source_path') == str(path) and state.get('remote') == self.base:
+                found.append((stage, state))
+        if len(found) > 1:
+            raise ValueError('Multiple retained backup-file attempts; use backups cleanup before retrying')
+        if found:
+            stage, state = found[0]
+            m = state['manifest']
+            self.validate_file_manifest(m, m['backup_id'])
+            if state['source_state'] != initial or m['sidecars'] != sidecars or m['storage'] != row['storage'] or m['source_node'] != self.node:
+                raise ValueError('Source backup changed since interrupted upload; cleanup the old attempt first')
+            if sha256(path) != m['sha256']:
+                raise ValueError('Source backup checksum changed')
+            console.note(f'Resuming existing backup-file upload: {stage}')
+        else:
+            width = getattr(self.a, 'part_size', None) or VMA_PART_SIZE
+            initial, parts, digest = self.scan_file(path, width)
+            bid = f"{row['storage']}/{row['vmid']}/{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}"
+            m = dict(schema=1, format='pve-backup-file', transport={'format': 'pve-drive-parts', 'version': 1},
+                     backup_id=bid, source=self.a.source, source_node=self.node, storage=row['storage'],
+                     vmid=row['vmid'], filename=path.name, size=initial['size'], sha256=digest,
+                     part_size=width, parts=parts, sidecars=sidecars, protected=row['protected'],
+                     created_utc=datetime.now(timezone.utc).isoformat(), backup_time=row.get('ctime'),
+                     original_volume=row['volid'])
+            self.validate_file_manifest(m, bid)
+            stage = self.stage('backup-file-')
+            state = dict(remote=self.base, source_path=str(path), source_state=initial, manifest=m)
+            atomic_json(stage / 'upload.json', state)
+        if any(x.is_symlink() for x in stage.rglob('*')):
+            raise ValueError('Upload staging refuses symlinks')
+        destination = self.base + '/' + m['backup_id']
+        self.quota_retry(lambda: self.rc('mkdir', destination))
+        verified = self.remote_parts(destination, m, allow_missing=True)
+        spool = stage / 'spool'; spool.mkdir(exist_ok=True)
+        allowed_parts = {p['filename'] for p in m['parts']}
+        for previous in spool.iterdir():
+            if previous.name not in allowed_parts or not previous.is_file():
+                raise ValueError('Unexpected spool file; refusing to overwrite')
+            previous.unlink()  # All parts are reproducible from the unchanged source file.
+        self.require_staging_space(stage, min(self.a.transfers * m['part_size'], m['size']) + 1024 ** 3,
+                                   'Insufficient space for bounded backup spool')
+        missing = [(i, part) for i, part in enumerate(m['parts'])
+                   if part['filename'] not in verified or getattr(self.a, 'deep_verify', False)]
+        def send(item, cancel):
+            index, part = item
+            local = spool / part['filename']
+            with path.open('rb') as src, local.open('wb') as out:
+                src.seek(index * m['part_size'])
+                left = part['size']
+                while left:
+                    if cancel.is_set():
+                        raise RuntimeError('Backup upload cancelled')
+                    block = src.read(min(left, 8 * 1024 ** 2))
+                    if not block:
+                        raise ValueError('Source backup truncated')
+                    out.write(block); left -= len(block)
+                out.flush(); os.fsync(out.fileno())
+            self.upload_vma_part(local, part, destination, cancel)
+            local.unlink()
+            return part['size']
+        console.note(f"Source backup retained unless --delete-local was specified; {len(verified)} parts already verified")
+        console.stage('Uploading existing backup parts in parallel')
+        self.parallel(missing, send, sum(p['size'] for _, p in missing))
+        self.remote_parts(destination, m)
+        def unchanged_file():
+            self.idle()
+            if (path.is_symlink() or file_details(path) != initial or self.sidecars(path) != original_sidecars
+                    or sha256(path) != m['sha256']):
+                raise ValueError('Source backup changed; refusing completion/deletion')
+        unchanged_file()
+        manifest = stage / 'manifest.json'; atomic_json(manifest, m)
+        self.quota_retry(lambda: self.rc('copyto', manifest, destination + '/manifest.json', '--immutable', '--checksum', '--drive-stop-on-upload-limit'))
+        if self.rc('cat', destination + '/manifest.json', capture=True).encode() != manifest.read_bytes():
+            raise ValueError('Backup manifest read-back mismatch')
+        marker = stage / 'COMPLETE'; marker.write_bytes((sha256(manifest) + '\n').encode('ascii'))
+        self.quota_retry(lambda: self.rc('copyto', marker, destination + '/COMPLETE', '--immutable', '--checksum', '--drive-stop-on-upload-limit'))
+        if self.file_manifest(m['backup_id']) != m:
+            raise ValueError('Backup completion verification failed')
+        if getattr(self.a, 'delete_local', False):
+            unchanged_file()
+            fresh = [x for x in self.local() if x['volid'] == row['volid']]
+            if len(fresh) != 1 or fresh[0]['protected'] or fresh[0]['path'] != str(path):
+                raise ValueError('Backup protection or storage identity changed; refusing deletion')
+            if file_details(path) != initial:
+                raise ValueError('Backup changed immediately before deletion')
+            run('pvesm', 'free', row['volid'])
+        self.finish_staging(stage)
+        console.note(f"Backup file archived: {m['backup_id']}; local " + ('removed' if getattr(self.a, 'delete_local', False) else 'retained'))
+        return m
+
+    def download_file(self, bid):
+        self.idle()
+        m = self.file_manifest(bid)
+        store = self.select_store(m)
+        directory = Path(store['directory'])
+        target = directory / m['filename']
+        destinations = [target] + [directory / name for name in m['sidecars']]
+        # Hidden same-filesystem staging avoids exposing an incomplete backup to PVE.
+        key = hashlib.sha256((self.base + '/' + bid).encode()).hexdigest()[:24]
+        stage = directory / ('.pve-drive-' + key)
+        if stage.is_symlink():
+            raise ValueError('Download staging is a symlink')
+        def conflict():
+            for p in destinations:
+                local = stage / p.name
+                if p.is_symlink() or (p.exists() and (not local.is_file() or local.is_symlink() or not os.path.samefile(p, local))):
+                    return True
+            return False
+        if conflict():
+            raise ValueError('Destination backup or metadata already exists; refusing overwrite')
+        stage.mkdir(mode=0o700, exist_ok=True)
+        if any(p.is_symlink() for p in stage.rglob('*')):
+            raise ValueError('Download staging refuses symlinks')
+        receipt = dict(remote=self.base, manifest=m, directory=str(directory), storage=store['storage'])
+        record = stage / 'download.json'
+        if not record.exists() and any(stage.iterdir()):
+            raise ValueError('Unrecognized download staging contents')
+        if record.exists() and json.loads(record.read_text()) != receipt:
+            raise ValueError('Download recovery identity mismatch')
+        atomic_json(record, receipt)
+        if target.exists():
+            if target.stat().st_size != m['size'] or sha256(target) != m['sha256']:
+                raise ValueError('Previously published backup checksum mismatch')
+            for name, encoded in m['sidecars'].items():
+                if (directory / name).read_bytes() != base64.b64decode(encoded, validate=True):
+                    raise ValueError('Previously published metadata mismatch')
+            shutil.rmtree(stage)
+            console.note('Previous download completed; verified published backup and removed staging')
+            return target
+        console.note(f"Destination: {store['storage']} ({directory}); recovery files: {stage}")
+        parts = stage / 'parts'; parts.mkdir(exist_ok=True)
+        destination = self.base + '/' + bid
+        def receive(part, cancel):
+            local = parts / part['filename']
+            if not local.is_file() or local.stat().st_size != part['size'] or file_hash(local, progress=False) != part['sha256']:
+                self.part_rc(cancel, 'copyto', destination + '/' + part['filename'], local, '--ignore-times', '--multi-thread-streams', '0')
+            if local.stat().st_size != part['size'] or file_hash(local, progress=False) != part['sha256']:
+                raise ValueError('Downloaded backup part checksum mismatch')
+            return part['size']
+        console.stage('Downloading backup-file parts in parallel')
+        self.parallel(m['parts'], receive, m['size'])
+        rebuilt = stage / m['filename']
+        if rebuilt.is_file() and rebuilt.stat().st_size == m['size'] and sha256(rebuilt) == m['sha256']:
+            console.note('Retained reconstructed backup passed whole-file SHA-256 verification')
+        else:
+            rebuilt.unlink(missing_ok=True)
+            check_parts(parts, m, rebuilt)
+        self.idle()
+        # Re-resolve storage after long transfers, including quota/network delays.
+        current = [x for x in self.stores() if x['storage'] == store['storage'] and x['suitable']]
+        if len(current) != 1 or current[0]['directory'] != str(directory):
+            raise ValueError('Destination storage changed during download')
+        if conflict():
+            raise ValueError('Destination appeared during download; files retained')
+        # Metadata first; link() publishes the fully verified backup without overwriting.
+        # On errors the staged source stays available; existing destinations are never removed.
+        for name, encoded in m['sidecars'].items():
+            local = stage / name
+            data = base64.b64decode(encoded, validate=True)
+            if (directory / name).exists():
+                if local.read_bytes() != data:
+                    raise ValueError('Published sidecar changed during interrupted download')
+            else:
+                with local.open('wb') as out:
+                    out.write(data)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.link(local, directory / name)
+        os.link(rebuilt, target)
+        shutil.rmtree(stage)
+        console.note(f"Backup returned to {store['storage']}: {target.name}; cloud copy retained. No VM created.")
+        return target
+
+    def cleanup_files(self):
+        candidates = list(self.work.glob('backup-file-*')) if self.work.is_dir() else []
+        for store in self.stores():
+            if store['suitable']:
+                candidates.extend(Path(store['directory']).glob('.pve-drive-*'))
+        requested = getattr(self.a, 'stage', None)
+        if not requested:
+            if self.a.apply:
+                raise ValueError('--apply requires --stage from backups cleanup')
+            for path in candidates:
+                print(path)
+            return
+        stage = Path(requested)
+        if stage.is_symlink() or stage.is_mount() or stage.resolve() not in {p.resolve() for p in candidates if not p.is_symlink()}:
+            raise ValueError('Select a discovered backup-file staging directory')
+        for root, dirs, files in os.walk(stage, followlinks=False):
+            for name in dirs + files:
+                path = Path(root) / name
+                if path.is_symlink() or path.is_mount():
+                    raise ValueError('Cleanup refuses symlinks or nested mounts')
+        record = stage / ('upload.json' if stage.name.startswith('backup-file-') else 'download.json')
+        state = json.loads(record.read_text())
+        m = state['manifest']; self.validate_file_manifest(m, m['backup_id'])
+        if state['remote'] != self.base:
+            raise ValueError('Cleanup remote/source mismatch')
+        if stage.name.startswith('backup-file-') and m['source_node'] != self.node:
+            raise ValueError('Upload cleanup must run on the original node')
+        destination = self.base + '/' + m['backup_id']
+        def incomplete():
+            rows = json.loads(self.rc('lsjson', self.a.remote.rstrip('/'), '--recursive', '--files-only', capture=True))
+            prefix = destination[len(self.a.remote.rstrip('/')) + 1:] + '/'
+            return prefix + 'COMPLETE' not in {r['Path'] for r in rows}
+        remove_remote = stage.name.startswith('backup-file-') and incomplete()
+        console.note(f'Cleanup local staging: {stage}; incomplete cloud removal: {remove_remote}. Completed backups retained.')
+        if self.a.apply:
+            if remove_remote and incomplete():
+                self.rc('purge', destination)
+                rows = json.loads(self.rc('lsjson', self.a.remote.rstrip('/'), '--recursive', '--files-only', capture=True))
+                prefix = destination[len(self.a.remote.rstrip('/')) + 1:] + '/'
+                if any(row['Path'].startswith(prefix) for row in rows):
+                    raise ValueError('Remote cleanup not confirmed; recovery data retained')
+            shutil.rmtree(stage)
+            console.note('Backup-file staging removed')
+
+    def backups(self):
+        action = self.a.backup_action
+        if action == 'stores':
+            for store in self.stores():
+                print(f"{store['storage']}  {store.get('directory', '-')}  {human_bytes(store.get('free', 0))} free  {store['reason'] or 'available'}")
+        elif action == 'list':
+            self.listing_files()
+        elif action == 'cleanup':
+            self.cleanup_files()
+        else:
+            for selector in self.a.items:
+                (self.upload_file if action == 'upload' else self.download_file)(selector)
+
+
 def parser():
     p = argparse.ArgumentParser(prog='pve-drive',
-        description='Move Proxmox QEMU VMs to/from cloud storage using rclone. '
+        description='Archive Proxmox VMs and existing backup files to Google Drive with parallel verified transfers. '
                     'Upload retains the stopped VM by default; --delete-vm explicitly removes it after verification.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Examples (global options go BEFORE the command):\n'
+        epilog='Run pve-drive with no arguments for the interactive menu. Explicit commands never prompt.\n\n'
+               'Examples (global options go BEFORE the command):\n'
+               '  pve-drive --remote gdrive:pve-archive --source pve-site-a interactive\n'
+               '  pve-drive --remote gdrive:pve-archive --source pve-site-a backups list\n'
                '  pve-drive --remote gdrive:pve-archive --source pve-site-a upload 100\n'
                '  pve-drive --remote gdrive:pve-archive --source pve-site-a list\n'
                '  pve-drive --remote gdrive:pve-archive --source pve-site-a restore 100\n'
@@ -2587,13 +3147,182 @@ def parser():
                              help='Advanced: concurrent multipart downloads (default: 8)')
         command.add_argument('--resume', metavar='STAGING_DIR',
                              help='Reuse verified parts from an interrupted multipart download/reconstruction')
+    sub.add_parser('interactive', help='Browse VMs, backup files, cloud archives and cleanup in a terminal menu')
+    library = sub.add_parser('backups', help='Discover and transfer existing PVE backup files; no VM lifecycle changes')
+    actions = library.add_subparsers(dest='backup_action', required=True)
+    actions.add_parser('stores', help='Discover local backup stores and available space')
+    ls = actions.add_parser('list', help='List backup files across all local stores and the cloud')
+    ls.add_argument('--location', choices=['all', 'local', 'cloud'], default='all')
+    up = actions.add_parser('upload', help='Upload existing backup files; retain local files by default')
+    up.add_argument('items', nargs='+', metavar='VOLUME_OR_FILENAME', help='Volume from backups list, or an unambiguous filename')
+    up.add_argument('--delete-local', action='store_true', help='Remove local backup via Proxmox only after cloud verification; protected backups cannot be removed')
+    up.add_argument('--part-size', type=part_size, default=None, help='Binary size; default 256M')
+    up.add_argument('--transfers', type=transfer_count, default=TRANSFERS)
+    up.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'], default='128M')
+    up.add_argument('--deep-verify', action='store_true')
+    up.add_argument('--quota-retries', type=int, choices=range(169), default=24, metavar='N')
+    up.add_argument('--quota-retry-delay', type=int, choices=range(60, 86401), default=3600, metavar='SECONDS')
+    up.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Keep recovery staging after success (original backup is retained independently)')
+    down = actions.add_parser('download', help='Return cloud backup files to PVE backup storage; never creates a VM')
+    down.add_argument('items', nargs='+', type=library_id, metavar='BACKUP_ID')
+    down.add_argument('--storage', help='Destination PVE store; auto chooses original or most free space. Default: original/only suitable store; ambiguity fails without prompting')
+    down.add_argument('--transfers', type=transfer_count, default=TRANSFERS)
+    clean = actions.add_parser('cleanup', help='Discover or discard backup-file upload/download staging')
+    clean.add_argument('--stage', help='Exact path printed by backups cleanup')
+    clean.add_argument('--apply', action='store_true', help='Apply removal; default preview')
     return p
 
 
 
+def command_arguments(args, command):
+    base = ['--remote', args.remote, '--source', args.source, '--work-dir', args.work_dir,
+            '--rclone-config', args.rclone_config]
+    if args.verbose:
+        base.append('--verbose')
+    return parser().parse_args(base + command)
+
+
+def execute_command(args):
+    """One operation lock and implementation for direct commands and menu actions."""
+    import fcntl
+    with open('/run/lock/pve-drive.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if args.command in ('upload', 'move-to-cloud', 'archive'):
+            console.note('Plan: preflight → stop VM → prepare and verify → upload → verify remote and source → publish → finish')
+            console.note('Source VM policy: ' + ('DELETE after successful verification (--delete-vm).' if args.delete_vm else 'retain stopped (default).'))
+        console.stage('Checking prerequisites')
+        manager = BackupLibrary(args) if args.command == 'backups' else Manager(args)
+        if args.command == 'restore' and args.vmid is None:
+            args.vmid = vmid(args.backup_id)
+            manager.move_from_cloud()
+        else:
+            method = {'list': 'listing', 'upload': 'move_to_cloud'}.get(args.command, args.command.replace('-', '_'))
+            getattr(manager, method)()
+        console.complete_stage()
+        console.note('Complete')
+
+
+def interactive_setup():
+    if not sys.stdin.isatty():
+        raise ValueError('Use explicit commands in unattended jobs; run pve-drive --help')
+    remotes = run('rclone', '--config', '/root/.config/rclone/rclone.conf', 'listremotes', capture=True).splitlines()
+    remote = choose_rows('Choose your configured rclone remote', remotes, str)
+    if remote is None:
+        return None
+    folder = input('Archive folder [pve-archive]: ').strip() or 'pve-archive'
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_/-]*', folder) or '..' in folder.split('/'):
+        raise ValueError('Use a relative archive folder without dot segments')
+    source = Path('/etc/pve/local').resolve().name
+    source = input(f'Source PVE label [{source}]: ').strip() or source
+    return parser().parse_args(['--remote', remote + folder, '--source', source, 'interactive'])
+
+
+def interactive_actions(args, action):
+    """Build reviewable commands. Reading menus does not hold the operation lock."""
+    manager, library = Manager(args), BackupLibrary(args)
+    if action == 'Choose source label':
+        rows = json.loads(manager.rc('lsjson', args.remote.rstrip('/'), '--recursive', '--dirs-only', capture=True))
+        labels = sorted({p['Path'].split('/')[1] for p in rows if p['Path'].startswith(('sources/', 'backup-files/')) and len(p['Path'].split('/')) >= 2} | {args.source})
+        picked = choose_rows('Original source label', labels, str)
+        if picked:
+            args.source = source_name(picked)
+        return [], False
+    if action == 'Archive a VM':
+        rows = manager.api(f'/nodes/{library.node}/qemu')
+        selected = choose_rows('Select VMs to stop and archive', rows,
+                               lambda x: f"{x['vmid']}  {x.get('name', '')}  {x.get('status', '')}", multiple=True)
+        if not selected:
+            return [], False
+        policy = choose_rows('Source policy', ['Retain VMs stopped', 'Delete VMs after verification'], str, default=1)
+        destructive = policy == 'Delete VMs after verification'
+        return [['upload', str(x['vmid'])] + (['--delete-vm'] if destructive else []) for x in selected], destructive
+    if action == 'Local backup files':
+        selected = choose_rows('Local backups across discovered stores', library.local(),
+                               lambda x: f"{x['storage']}  {x['filename']}  {human_bytes(x['size'])}" + ('  protected' if x['protected'] else ''), multiple=True)
+        if not selected:
+            return [], False
+        policy = choose_rows('Upload policy', ['Copy; retain local files', 'Move; delete local files after verification'], str, default=1)
+        destructive = policy.startswith('Move')
+        if destructive and any(x['protected'] for x in selected):
+            raise ValueError('Selection includes protected backups; choose Copy')
+        return [['backups', 'upload'] + [x['volid'] for x in selected] + (['--delete-local'] if destructive else [])], destructive
+    if action == 'Cloud backup files':
+        selected = choose_rows('Cloud backup files', library.cloud(),
+                               lambda x: f"{x['storage']}  {x['filename']}  {human_bytes(x['size'])}  {x['backup_id']}", multiple=True)
+        if not selected:
+            return [], False
+        commands = []
+        library.a = command_arguments(args, ['backups', 'download', selected[0]['backup_id']])
+        library.a.interactive = True
+        for item in selected:
+            store = library.select_store(item)
+            commands.append(['backups', 'download', item['backup_id'], '--storage', store['storage']])
+        print('Space per backup: twice its size plus 1 GiB. Cloud copies retained; no VMs created.')
+        return commands, False
+    if action == 'Cloud VM archives / restore':
+        rows = json.loads(manager.rc('lsjson', manager.base, '--recursive', '--files-only', capture=True))
+        ids = sorted({x['Path'][:-9] for x in rows if x['Path'].endswith('/COMPLETE')})
+        archives = [manager.manifest(bid)[1] for bid in ids]
+        selected = choose_rows('Cloud VM archives', archives,
+                               lambda x: f"VM {x['vmid']}  {x.get('config', {}).get('name', '')}  {human_bytes(x['size'])}  {x['backup_id']}")
+        if not selected:
+            return [], False
+        next_id = str(manager.api('/cluster/nextid'))
+        target = vmid(input(f'Unused destination VMID [{next_id}]: ').strip() or next_id)
+        stores = [x for x in manager.api(f'/nodes/{library.node}/storage')
+                  if x.get('active') and x.get('enabled', 1) and 'images' in x.get('content', '').split(',')]
+        store = choose_rows('Destination VM disk storage', sorted(stores, key=lambda x: -x.get('avail', 0)),
+                            lambda x: f"{x['storage']}  {human_bytes(x.get('avail', 0))} free", default=1)
+        if not store:
+            return [], False
+        print('Restore creates a stopped VM with new MAC addresses. Review hardware and guest IPs before starting it.')
+        return [['restore', selected['backup_id'], target, '--storage', store['storage'], '--unique']], False
+    paths = [(p, p.name.startswith('backup-file-')) for p in manager.work.iterdir() if p.is_dir() and not p.is_symlink()] if manager.work.exists() else []
+    for store in library.stores():
+        if store['suitable']:
+            paths += [(p, True) for p in Path(store['directory']).glob('.pve-drive-*')]
+    picked = choose_rows('Cleanup staging (completed cloud backups are retained)', paths, lambda x: str(x[0]))
+    if not picked:
+        return [], False
+    preview = (['backups', 'cleanup'] if picked[1] else ['cleanup']) + ['--stage', str(picked[0])]
+    execute_command(command_arguments(args, preview))
+    return [preview + ['--apply']], True
+
+
+def interactive_menu(args):
+    if not sys.stdin.isatty() or not args.source:
+        raise ValueError('Interactive mode requires a terminal and source label')
+    while True:
+        try:
+            action = choose_rows(f'pve-drive | {args.remote} | source {args.source}',
+                                 ['Archive a VM', 'Local backup files', 'Cloud backup files',
+                                  'Cloud VM archives / restore', 'Cleanup attempts', 'Choose source label', 'Exit'], str)
+            if action in (None, 'Exit'):
+                return
+            commands, destructive = interactive_actions(args, action)
+            if commands:
+                print('Actions to run:')
+                for item in commands:
+                    print('  pve-drive --remote ' + args.remote + ' --source ' + args.source + ' ' + ' '.join(item))
+                word = 'DELETE' if destructive else 'yes'
+                if input(f'Type {word} to proceed (Enter cancels): ').strip() != word:
+                    continue
+                for item in commands:
+                    execute_command(command_arguments(args, item))
+        except (ValueError, RuntimeError, OSError) as error:
+            console.fail_stage()
+            console.note(f'Operation failed: {error}. Recovery data retained; remaining batch items were not started.')
+        except (EOFError, KeyboardInterrupt):
+            console.fail_stage()
+            console.note('Interactive session ended; recovery data retained for interrupted operations')
+            return
+
+
 def main():
     global console
-    args = parser().parse_args()
+    args = interactive_setup() if len(sys.argv) == 1 else parser().parse_args()
+    if args is None:
+        return
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise ValueError('Run as root on Linux (archive/restore require a Proxmox node)')
     def interrupted(signum, frame):
@@ -2608,22 +3337,11 @@ def main():
     console.enabled = True
     console.note(f'pve-drive {__version__} | {args.command} | source {args.source or "legacy"}')
     console.note(f'Log: {log_path}')
-    if args.command in ('upload', 'move-to-cloud', 'archive'):
-        console.note('Plan: preflight → stop VM → prepare and verify → upload → verify remote and source → publish → finish')
-        console.note('Source VM policy: ' + ('DELETE after successful verification (--delete-vm).' if args.delete_vm else 'retain stopped (default).'))
-    console.stage('Checking prerequisites')
-    # One operation per node, regardless of work directory or destination.
-    with open('/run/lock/pve-drive.lock', 'w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        manager = Manager(args)
-        if args.command == 'restore' and args.vmid is None:
-            args.vmid = vmid(args.backup_id)
-            manager.move_from_cloud()
-        else:
-            method = {'list': 'listing', 'upload': 'move_to_cloud'}.get(args.command, args.command.replace('-', '_'))
-            getattr(manager, method)()
-    console.complete_stage()
-    console.note('Complete')
+    if args.command == 'interactive':
+        interactive_menu(args)
+    else:
+        execute_command(args)
+
 
 
 if __name__ == '__main__':

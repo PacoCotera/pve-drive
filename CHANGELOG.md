@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0
+
+- Add existing backup-file inventory across enabled accessible PVE backup stores, including custom backup directories.
+- Add bounded parallel upload/copy/move and verified download back to an original or selected local store, preserving file bytes and available notes/protection metadata.
+- Add original-store discovery, automatic destination choice, quota/interruption recovery, and guarded backup-file cleanup.
+- Add a terminal menu for VM archives, local/cloud backup files, VM restoration, batch selection, and cleanup. Explicit commands remain noninteractive.
+- Keep originals by default; protected local backups cannot be moved. Backup-file downloads never create a VM.
+
+
 ## 0.11.0
 
 - Retain source VMs by default; require explicit `--delete-vm`. Remove `--keep-vm`.

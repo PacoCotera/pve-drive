@@ -42,7 +42,15 @@ class BoundedVmaPipelineTests(unittest.TestCase):
             with guard:
                 metrics['active'] += 1
                 metrics['peak_active'] = max(metrics['peak_active'], metrics['active'])
-                metrics['peak_bytes'] = max(metrics['peak_bytes'], sum(x.stat().st_size for x in path.parent.iterdir()))
+                observed_bytes = 0
+                for item in path.parent.iterdir():
+                    try:
+                        observed_bytes += item.stat().st_size
+                    except FileNotFoundError:
+                        # Production can rename a partial file and other workers
+                        # can release verified parts while this sample is taken.
+                        continue
+                metrics['peak_bytes'] = max(metrics['peak_bytes'], observed_bytes)
             if int(part['filename'].rsplit('-', 1)[1]) < 2:
                 barrier.wait(timeout=5)
             time.sleep(.03)

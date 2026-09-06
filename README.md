@@ -12,6 +12,8 @@ pve-drive takes care of shutting down, archiving, verifying, and restoring Proxm
 - **Wait out Google Drive upload quotas.** Recognized quota blocks retry hourly, up to 24 times by default. Streaming production pauses when the spool fills and continues when uploads can proceed. Retained recovery data lets eligible interrupted uploads and downloads resume.
 - **Keep supported QCOW2 snapshots intact.** VMs with supported internal snapshots use native archives that preserve exact QCOW2 bytes and Proxmox snapshot configuration. No disk conversion is involved.
 - **Keep administration focused on VMs.** Upload, list, and restore by VMID. Archives are organized by source node label and VMID, and incomplete attempts stay out of the complete-backup listing. Guarded cleanup removes abandoned attempts.
+- **Free backup storage without creating another backup.** Discover existing backup files across all accessible PVE backup stores, copy or explicitly move them to Drive, and download them back to a selected store. Original filenames, bytes, source-store identity, and available notes/protection metadata are retained.
+- **Browse instead of memorizing commands.** The terminal menu discovers VMs, backup files, and destination stores, supports batch selection, and shows an action summary before execution. Explicit commands remain available for unattended jobs.
 - **Restore where you need the VM.** Choose another node, an unused VMID, or destination storage. Keep the source by default, or explicitly reclaim its disks with `--delete-vm` after successful archive verification.
 
 ## Three everyday commands
@@ -42,6 +44,53 @@ Quota recovery keeps the same VMA stream only while its producer remains alive. 
 Throughput depends on the host, compression, network, and Drive. The [benchmark guide](BENCHMARK.md) provides a reproducible comparison with single-file uploads. Transfer and part tuning are available under `upload --help` and `restore --help`; routine use needs no extra switches.
 
 **Status: experimental.** Validate upload, restore, and snapshot rollback before using `--delete-vm`.
+
+## Interactive administration
+
+Run `pve-drive` in a terminal to select a configured rclone remote and source label, then browse the menu. If you already know the remote and source:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a interactive
+```
+
+The menu offers VM archiving, local backup files, cloud backup files, cloud VM archives/restoration, cleanup, and source-label selection. Select several VMs or backup files by entering comma-separated numbers. Transfers run sequentially between backups, with parallel parts within each backup. A failed operation stops the remaining batch.
+
+Every operation shows a summary before execution. Retention is the default; destructive actions require typing `DELETE`. Press Enter to cancel a selection with no default, or Ctrl-C to exit. The operation lock is held during work, not while you browse menus.
+
+Explicit commands never prompt. They use supplied arguments and safe defaults, or fail with an explanation when a choice is needed.
+
+## Existing local backup files
+
+Browse backups from all enabled, accessible filesystem backup stores, including mounted shares:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a backups stores
+pve-drive --remote gdrive:pve-archive --source pve-site-a backups list
+```
+
+The inventory shows the store, VMID, filename, size, protection status, and local/cloud location. `both*` means a local filename/size matches a cloud entry; listing does not hash large local backups or certify byte equality. Use `--location local` or `--location cloud` to limit discovery.
+
+Upload an existing backup without stopping or changing a VM:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  backups upload vzdump-qemu-100-2026_09_06-12_00_00.vma.zst
+```
+
+An unambiguous filename is enough. If several stores contain that filename, use the `STORE:backup/FILENAME` volume printed by the listing, or select it in the menu. Add `--delete-local` to move the local backup only after all cloud parts, the manifest, and completion marker pass verification. Protected backups can be copied but cannot be moved. The default upload spool uses at most 2 GiB of payload files plus 1 GiB of free-space headroom.
+
+Return a cloud backup to local PVE backup storage:
+
+```bash
+pve-drive --remote gdrive:pve-archive --source pve-site-a \
+  backups download BACKUP_ID --storage auto
+```
+
+Use the ID from `backups list`. The original store is preferred when suitable; otherwise `auto` selects the suitable store with the most free space. `--storage backup-hdd` selects a particular store. Without `--storage`, direct commands use the original or sole suitable store and reject ambiguity; the menu offers a numbered recommendation. Storage is checked again for each download.
+
+Downloads need space for parts and reconstruction: twice the backup size plus 1 GiB. Verified recovery data reduces the space needed when resuming. A complete verified file is published under its original name in the selected store; existing files are never overwritten. **Downloading a backup file does not restore or create a VM.** The cloud copy remains available.
+
+Repeat the same upload/download command after interruption to resume. Backup-file transfers preserve exact bytes rather than regenerate a stream. See [backup-file recovery and format](BACKUP_FILES.md) for quota handling, cleanup, metadata, and supported formats. PBS datastores are identified but excluded because they are not standalone backup files.
 
 ## Installation
 
