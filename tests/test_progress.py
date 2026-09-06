@@ -12,6 +12,7 @@ import pve_drive as p
 class ProgressTests(unittest.TestCase):
     def test_server_time_and_completion_duration_in_console_and_log(self):
         c, stream = self.display()
+        c.started = 1000.0  # Exact clock origin, independent of host uptime/float rounding.
         from datetime import datetime
         with patch.object(p, 'datetime') as clock, patch.object(p.time, 'monotonic', return_value=c.started + 12):
             clock.now.return_value = datetime(2026, 9, 6, 16, 33, 29)
