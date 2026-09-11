@@ -22,7 +22,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.12.0'
+__version__ = '0.12.1'
 
 PART_SIZE = 4 * 1024 ** 3
 TRANSFERS = 8
@@ -1407,13 +1407,15 @@ class Manager:
         return run('rclone', '--config', self.a.rclone_config, '--retries', '5',
                    '--low-level-retries', '10', *args, capture=capture, cancel_event=cancel, progress=False)
 
-    def upload_vma_part(self, path, part, destination, cancel):
+    def upload_vma_part(self, path, part, destination, cancel, prehashed=False):
         if cancel.is_set():
             raise RuntimeError('Multipart upload cancelled')
         if path.is_symlink() or not path.is_file():
             raise ValueError('Missing local VMA part')
-        sha, md5 = file_hash(path, 'both', progress=False)
-        if path.stat().st_size != part['size'] or sha != part['sha256'] or md5 != part['md5']:
+        before = file_details(path)
+        sha, md5 = ((part['sha256'], part['md5']) if prehashed
+                    else file_hash(path, 'both', progress=False))
+        if before['size'] != part['size'] or sha != part['sha256'] or md5 != part['md5']:
             raise ValueError('Local VMA part checksum mismatch')
         remote = destination + '/' + part['filename']
         self.quota_retry(lambda: self.part_rc(cancel, 'copyto', path, remote, '--immutable', '--checksum',
@@ -1426,7 +1428,8 @@ class Manager:
         if getattr(self.a, 'deep_verify', False):
             self.part_rc(cancel, 'check', path.parent, destination, '--include', '/' + part['filename'],
                          '--one-way', '--download')
-        if file_hash(path, 'sha256', progress=False) != part['sha256']:
+        if (path.is_symlink() or file_details(path) != before
+                or (not prehashed and file_hash(path, 'sha256', progress=False) != part['sha256'])):
             raise ValueError('VMA part changed during upload')
 
     def archive_vma_multipart(self, ident, cfg, external_media):
@@ -2767,6 +2770,169 @@ class BackupLibrary(Manager):
             raise ValueError('Missing cloud backup parts')
         return verified
 
+    def upload_file_single_pass(self, row, path, sidecars, original_sidecars, initial, found):
+        """Hash the source while producing bounded upload parts; never pre-scan it.
+
+        Receipts have a full-size manifest skeleton, but only hashed_parts entries
+        are authoritative until the entire stream has been consumed. The skeleton
+        stays local. A retry rereads the source once to rebuild its whole digest,
+        comparing the recorded prefix and skipping verified cloud parts.
+        """
+        if found:
+            stage, state = found[0]
+            m = state['manifest']
+            self.validate_file_manifest(m, m['backup_id'])
+            if (state['source_state'] != initial or m['sidecars'] != sidecars
+                    or m['storage'] != row['storage'] or m['source_node'] != self.node
+                    or m['filename'] != path.name or m['size'] != initial['size']):
+                raise ValueError('Source backup changed since interrupted upload; cleanup the old attempt first')
+            recorded = state.get('hashed_parts')
+            if type(recorded) is not int or not 0 <= recorded <= len(m['parts']):
+                raise ValueError('Invalid backup upload checkpoint')
+            if any(p['sha256'] != '0' * 64 or p['md5'] != '0' * 32 for p in m['parts'][recorded:]):
+                raise ValueError('Invalid unhashed backup upload checkpoint')
+            console.note(f'Resuming single-pass upload: {stage}; rereading source once to validate it')
+        else:
+            width = getattr(self.a, 'part_size', None) or VMA_PART_SIZE
+            bid = f"{row['storage']}/{row['vmid']}/{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}"
+            parts = [dict(filename=f'part-{i:06d}', size=min(width, initial['size'] - offset),
+                          sha256='0' * 64, md5='0' * 32)
+                     for i, offset in enumerate(range(0, initial['size'], width))]
+            m = dict(schema=1, format='pve-backup-file', transport={'format': 'pve-drive-parts', 'version': 1},
+                     backup_id=bid, source=self.a.source, source_node=self.node, storage=row['storage'],
+                     vmid=row['vmid'], filename=path.name, size=initial['size'], sha256='0' * 64,
+                     part_size=width, parts=parts, sidecars=sidecars, protected=row['protected'],
+                     created_utc=datetime.now(timezone.utc).isoformat(), backup_time=row.get('ctime'),
+                     original_volume=row['volid'])
+            self.validate_file_manifest(m, bid)
+            stage = self.stage('backup-file-')
+            recorded = 0
+            state = dict(remote=self.base, source_path=str(path), source_state=initial,
+                         manifest=m, single_pass=True, hashed_parts=0)
+            atomic_json(stage / 'upload.json', state)
+        if any(x.is_symlink() for x in stage.rglob('*')):
+            raise ValueError('Upload staging refuses symlinks')
+        destination = self.base + '/' + m['backup_id']
+        self.quota_retry(lambda: self.rc('mkdir', destination))
+        verified = self.remote_parts(destination, m, allow_missing=True)
+        if not verified <= {p['filename'] for p in m['parts'][:recorded]}:
+            raise ValueError('Unrecorded cloud backup part')
+        spool = stage / 'spool'; spool.mkdir(exist_ok=True)
+        allowed = {p['filename'] for p in m['parts']}
+        for previous in spool.iterdir():
+            if previous.name not in allowed or not previous.is_file():
+                raise ValueError('Unexpected spool file; refusing to overwrite')
+            previous.unlink()
+        self.require_staging_space(stage, min(self.a.transfers * m['part_size'], m['size']) + 1024 ** 3,
+                                   'Insufficient space for bounded backup spool')
+
+        def unchanged():
+            if path.is_symlink() or file_details(path) != initial or self.sidecars(path) != original_sidecars:
+                raise ValueError('Source backup changed; refusing completion/deletion')
+
+        cancel = threading.Event()
+        whole, consumed, completed = hashlib.sha256(), 0, 0
+        previous_digest = m['sha256']
+        console.note(f'{len(verified)} cloud parts already verified; hashing as source is read for upload')
+        console.stage('Uploading existing backup parts: single source pass')
+        with ThreadPoolExecutor(max_workers=self.a.transfers) as pool:
+            pending = set()
+
+            def drain():
+                nonlocal pending, completed
+                finished, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    completed += future.result()
+                console.update(completed, m['size'])
+
+            def send(local, part):
+                self.upload_vma_part(local, part, destination, cancel, True)
+                local.unlink()
+                return part['size']
+
+            try:
+                with path.open('rb') as src:
+                    for i, expected in enumerate(m['parts']):
+                        while len(pending) >= self.a.transfers:
+                            drain()
+                        # Surface an already-failed worker before reading more source data.
+                        for future in pending:
+                            if future.done():
+                                future.result()
+                        needed = expected['filename'] not in verified or getattr(self.a, 'deep_verify', False)
+                        local = spool / expected['filename']
+                        out = local.open('xb') if needed else None
+                        sha, md5, left = hashlib.sha256(), hashlib.md5(usedforsecurity=False), expected['size']
+                        try:
+                            while left:
+                                block = src.read(min(left, 8 * 1024 ** 2))
+                                if not block:
+                                    raise ValueError('Source backup truncated')
+                                whole.update(block); sha.update(block); md5.update(block)
+                                if out is not None:
+                                    out.write(block)
+                                left -= len(block)
+                                consumed += len(block)
+                            if out is not None:
+                                out.flush(); os.fsync(out.fileno())
+                        finally:
+                            if out is not None:
+                                out.close()
+                        part = dict(filename=expected['filename'], size=expected['size'],
+                                    sha256=sha.hexdigest(), md5=md5.hexdigest())
+                        if i < recorded and part != expected:
+                            raise ValueError('Source backup checksum changed since interrupted upload')
+                        unchanged()
+                        m['parts'][i] = part
+                        state['hashed_parts'] = max(state['hashed_parts'], i + 1)
+                        # Persist checksums before any worker can publish this part.
+                        atomic_json(stage / 'upload.json', state)
+                        if needed:
+                            pending.add(pool.submit(send, local, part))
+                        else:
+                            completed += part['size']
+                            console.update(completed, m['size'])
+                    if src.read(1) or consumed != m['size']:
+                        raise ValueError('Source backup size changed')
+                unchanged()
+                if previous_digest != '0' * 64 and whole.hexdigest() != previous_digest:
+                    raise ValueError('Source backup checksum changed since interrupted upload')
+                m['sha256'] = whole.hexdigest()
+                atomic_json(stage / 'upload.json', state)
+                while pending:
+                    drain()
+            except BaseException:
+                cancel.set()
+                for future in pending:
+                    future.cancel()
+                raise
+        console.update(completed, m['size'], force=True)
+        console.complete_stage()
+        self.validate_file_manifest(m, m['backup_id'])
+        self.remote_parts(destination, m)
+        self.idle(); unchanged()
+        manifest = stage / 'manifest.json'; atomic_json(manifest, m)
+        self.quota_retry(lambda: self.rc('copyto', manifest, destination + '/manifest.json', '--immutable', '--checksum', '--drive-stop-on-upload-limit'))
+        if self.rc('cat', destination + '/manifest.json', capture=True).encode() != manifest.read_bytes():
+            raise ValueError('Backup manifest read-back mismatch')
+        marker = stage / 'COMPLETE'; marker.write_bytes((sha256(manifest) + '\n').encode('ascii'))
+        self.quota_retry(lambda: self.rc('copyto', marker, destination + '/COMPLETE', '--immutable', '--checksum', '--drive-stop-on-upload-limit'))
+        if self.file_manifest(m['backup_id']) != m:
+            raise ValueError('Backup completion verification failed')
+        if getattr(self.a, 'delete_local', False):
+            # Destructive moves retain the extra source hash immediately before deletion.
+            self.idle(); unchanged()
+            if sha256(path) != m['sha256']:
+                raise ValueError('Source backup changed; refusing deletion')
+            fresh = [x for x in self.local() if x['volid'] == row['volid']]
+            if len(fresh) != 1 or fresh[0]['protected'] or fresh[0]['path'] != str(path):
+                raise ValueError('Backup protection or storage identity changed; refusing deletion')
+            unchanged()
+            run('pvesm', 'free', row['volid'])
+        self.finish_staging(stage)
+        console.note(f"Backup file archived: {m['backup_id']}; local " + ('removed' if getattr(self.a, 'delete_local', False) else 'retained'))
+        return m
+
     def upload_file(self, selector):
         self.idle()
         matches = [r for r in self.local() if selector in (r['volid'], r['filename'])]
@@ -2792,6 +2958,8 @@ class BackupLibrary(Manager):
                 found.append((stage, state))
         if len(found) > 1:
             raise ValueError('Multiple retained backup-file attempts; use backups cleanup before retrying')
+        if not found or found[0][1].get('single_pass') is True:
+            return self.upload_file_single_pass(row, path, sidecars, original_sidecars, initial, found)
         if found:
             stage, state = found[0]
             m = state['manifest']
