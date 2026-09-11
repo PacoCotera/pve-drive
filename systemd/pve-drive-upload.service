@@ -1,0 +1,16 @@
+[Unit]
+Description=Upload latest successful Proxmox backups to Drive
+Wants=network-online.target
+After=network-online.target pve-cluster.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+EnvironmentFile=/etc/default/pve-drive-upload
+ExecStartPre=/usr/bin/mountpoint -q ${PVE_DRIVE_MOUNT}
+ExecStart=/usr/local/sbin/pve-drive --remote ${PVE_DRIVE_REMOTE} --source ${PVE_DRIVE_SOURCE} --work-dir ${PVE_DRIVE_WORK_DIR} backups upload-latest $PVE_DRIVE_VMIDS
+ExecStart=/usr/bin/rclone copy ${PVE_DRIVE_HOST_DIR} ${PVE_DRIVE_HOST_REMOTE} --immutable --checksum
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+KillMode=control-group
