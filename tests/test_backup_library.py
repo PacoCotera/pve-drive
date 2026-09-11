@@ -130,6 +130,81 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(self.lib.cloud(), [m])
         self.assertFalse(any(c[0] in ('qm', 'qmrestore', 'vzdump') for c in self.commands))
 
+    def test_copy_reads_source_once_and_uploads_before_end_of_source(self):
+        opened, read, first_upload = [], [0], []
+        original_open, original_rc = Path.open, self.lib.rc
+
+        class Reader:
+            def __init__(self, stream):
+                self.stream = stream
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.stream.close()
+            def read(self, count=-1):
+                block = self.stream.read(count)
+                read[0] += len(block)
+                return block
+
+        def tracked_open(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            if path == self.path and args and args[0] == 'rb':
+                opened.append(path)
+                return Reader(stream)
+            return stream
+
+        def tracked_rc(*args, **kwargs):
+            if args[0] == 'copyto' and '/part-' in str(args[2]) and not first_upload:
+                first_upload.append(read[0])
+            return original_rc(*args, **kwargs)
+
+        with patch.object(Path, 'open', tracked_open), patch.object(self.lib, 'rc', tracked_rc), \
+                patch.object(self.lib, 'part_rc', lambda cancel, *a, **kw: tracked_rc(*a, **kw)):
+            m = self.upload()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(read[0], len(self.data))
+        self.assertLess(first_upload[0], len(self.data))
+        self.assertEqual(m['sha256'], hashlib.sha256(self.data).hexdigest())
+
+    def test_prehashed_spool_corruption_rejected_by_remote_md5(self):
+        original = self.lib.upload_vma_part
+        def corrupt(path, *args):
+            path.write_bytes(b'!' * path.stat().st_size)
+            return original(path, *args)
+        with patch.object(self.lib, 'upload_vma_part', side_effect=corrupt):
+            with self.assertRaisesRegex(ValueError, 'MD5 mismatch'):
+                self.upload()
+        self.assertFalse(any(k.endswith('/COMPLETE') for k in self.remote))
+        self.assertTrue(self.path.exists())
+
+    def test_resume_validates_recorded_prefix_even_with_unchanged_metadata(self):
+        self.fail = lambda a: a[0] == 'copyto' and a[2].endswith('part-000003')
+        with self.assertRaises(RuntimeError):
+            self.upload()
+        initial = p.file_details(self.path)
+        original = p.file_details
+        self.path.write_bytes(b'!' + self.data[1:])
+        self.fail = None
+        with patch.object(p, 'file_details', side_effect=lambda path: initial if Path(path) == self.path else original(path)):
+            with self.assertRaisesRegex(ValueError, 'checksum changed'):
+                self.upload()
+        self.assertFalse(any(k.endswith('/COMPLETE') for k in self.remote))
+
+    def test_legacy_upload_receipt_still_resumes(self):
+        self.fail = lambda a: a[0] == 'copyto' and a[2].endswith('part-000003')
+        with self.assertRaises(RuntimeError):
+            self.upload()
+        receipt = next(self.lib.work.glob('backup-file-*/upload.json'))
+        state = json.loads(receipt.read_text())
+        initial, parts, digest = self.lib.scan_file(self.path, self.args.part_size)
+        state['manifest'].update(parts=parts, sha256=digest)
+        del state['single_pass']
+        del state['hashed_parts']
+        p.atomic_json(receipt, state)
+        self.fail = None
+        m = self.upload()
+        self.assertEqual(self.lib.file_manifest(m['backup_id']), m)
+
     def test_inventory_marks_both_as_unverified_name_size_match(self):
         self.upload()
         with patch('sys.stdout', io.StringIO()) as output:

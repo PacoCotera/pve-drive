@@ -79,6 +79,8 @@ pve-drive --remote gdrive:pve-archive --source pve-site-a \
 
 An unambiguous filename is enough. If several stores contain that filename, use the `STORE:backup/FILENAME` volume printed by the listing, or select it in the menu. Add `--delete-local` to move the local backup only after all cloud parts, the manifest, and completion marker pass verification. Protected backups can be copied but cannot be moved. The default upload spool uses at most 2 GiB of payload files plus 1 GiB of free-space headroom.
 
+New uploads calculate checksums while reading the source into upload parts, so transfers begin after the first part without a full-file checksum pre-scan. Normal copies read the source once; Drive part MD5 verification, the catalog and restore format are preserved. Resuming rereads the source once and reuses verified cloud parts. Explicit moves retain an extra source checksum check before deletion.
+
 Return a cloud backup to local PVE backup storage:
 
 ```bash
