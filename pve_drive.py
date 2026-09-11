@@ -22,7 +22,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import uuid
 
-__version__ = '0.12.2'
+__version__ = '0.12.1'
 
 PART_SIZE = 4 * 1024 ** 3
 TRANSFERS = 8
@@ -3172,43 +3172,6 @@ class BackupLibrary(Manager):
             shutil.rmtree(stage)
             console.note('Backup-file staging removed')
 
-    def upload_latest(self):
-        """Timer-friendly copy of the latest successful backup for explicit VMIDs."""
-        self.idle()
-        local = self.local()
-        cloud = self.cloud()
-        selected = []
-        for ident in dict.fromkeys(self.a.vmids):
-            rows = [r for r in local if r['vmid'] == int(ident) and r['size'] > 0]
-            if not rows:
-                raise ValueError(f'No accessible local backup for VM {ident}')
-            rows.sort(key=lambda r: (int(r.get('ctime') or 0), r['filename']), reverse=True)
-            row = rows[0]
-            if any(r['filename'] == row['filename'] for r in rows[1:]):
-                raise ValueError(f'Latest backup for VM {ident} exists on multiple stores; consolidate it first')
-            matching = [m for m in cloud if m['original_volume'] == row['volid']
-                        and m['source_node'] == self.node]
-            if matching:
-                if any(m['size'] != row['size'] for m in matching):
-                    raise ValueError(f'Cloud/local size conflict for {row["volid"]}')
-                console.note(f'Already archived: {row["volid"]} (catalog identity/size match; no source rehash)')
-                continue
-            # A finalized archive alone is not evidence that vzdump succeeded.
-            path = Path(row['path'])
-            sidecars = self.sidecars(path)
-            log_name = re.sub(r'\.(vma|tar)(?:\.(zst|gz|lzo|bz2))?$', '.log', path.name)
-            log = base64.b64decode(sidecars.get(log_name, '')).decode('utf-8', errors='replace')
-            if not re.search(rf'\bFinished Backup of VM {int(ident)}\b', log) or re.search(r'\bERROR:', log):
-                raise ValueError(f'Latest backup lacks a successful vzdump log: {row["volid"]}')
-            selected.append(row)
-        for row in selected:
-            console.note(f'{"Would upload" if self.a.dry_run else "Uploading latest"}: {row["volid"]}')
-            if not self.a.dry_run:
-                self.upload_file(row['volid'])
-        if not selected:
-            console.note('All selected VMs already have their latest backup archived')
-        return selected
-
     def backups(self):
         action = self.a.backup_action
         if action == 'stores':
@@ -3218,8 +3181,6 @@ class BackupLibrary(Manager):
             self.listing_files()
         elif action == 'cleanup':
             self.cleanup_files()
-        elif action == 'upload-latest':
-            self.upload_latest()
         else:
             for selector in self.a.items:
                 (self.upload_file if action == 'upload' else self.download_file)(selector)
@@ -3360,23 +3321,16 @@ def parser():
     actions.add_parser('stores', help='Discover local backup stores and available space')
     ls = actions.add_parser('list', help='List backup files across all local stores and the cloud')
     ls.add_argument('--location', choices=['all', 'local', 'cloud'], default='all')
-    for name in ('upload', 'upload-latest'):
-        up = actions.add_parser(name, help=('Upload existing backup files' if name == 'upload'
-                                          else 'Upload newest successful backups for explicit VMIDs, skipping catalog matches'))
-        if name == 'upload':
-            up.add_argument('items', nargs='+', metavar='VOLUME_OR_FILENAME', help='Volume from backups list, or an unambiguous filename')
-            up.add_argument('--delete-local', action='store_true', help='Remove local backup via Proxmox only after cloud verification; protected backups cannot be removed')
-        else:
-            up.add_argument('vmids', nargs='+', type=vmid, metavar='VMID')
-            up.add_argument('--dry-run', action='store_true', help='Show new successful backups without uploading')
-            up.set_defaults(delete_local=False)
-        up.add_argument('--part-size', type=part_size, default=None, help='Binary size; default 256M')
-        up.add_argument('--transfers', type=transfer_count, default=TRANSFERS)
-        up.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'], default='128M')
-        up.add_argument('--deep-verify', action='store_true')
-        up.add_argument('--quota-retries', type=int, choices=range(169), default=24, metavar='N')
-        up.add_argument('--quota-retry-delay', type=int, choices=range(60, 86401), default=3600, metavar='SECONDS')
-        up.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Keep recovery staging after success (original backup is retained independently)')
+    up = actions.add_parser('upload', help='Upload existing backup files; retain local files by default')
+    up.add_argument('items', nargs='+', metavar='VOLUME_OR_FILENAME', help='Volume from backups list, or an unambiguous filename')
+    up.add_argument('--delete-local', action='store_true', help='Remove local backup via Proxmox only after cloud verification; protected backups cannot be removed')
+    up.add_argument('--part-size', type=part_size, default=None, help='Binary size; default 256M')
+    up.add_argument('--transfers', type=transfer_count, default=TRANSFERS)
+    up.add_argument('--drive-chunk-size', choices=['8M', '16M', '32M', '64M', '128M', '256M'], default='128M')
+    up.add_argument('--deep-verify', action='store_true')
+    up.add_argument('--quota-retries', type=int, choices=range(169), default=24, metavar='N')
+    up.add_argument('--quota-retry-delay', type=int, choices=range(60, 86401), default=3600, metavar='SECONDS')
+    up.add_argument('--keep-local', dest='cleanup_local', action='store_false', default=True, help='Keep recovery staging after success (original backup is retained independently)')
     down = actions.add_parser('download', help='Return cloud backup files to PVE backup storage; never creates a VM')
     down.add_argument('items', nargs='+', type=library_id, metavar='BACKUP_ID')
     down.add_argument('--storage', help='Destination PVE store; auto chooses original or most free space. Default: original/only suitable store; ambiguity fails without prompting')
