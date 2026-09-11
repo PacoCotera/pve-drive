@@ -28,23 +28,6 @@ Download creates a hidden `.pve-drive-ID` directory inside the selected store's 
 
 No VM is created on download. After successful publication, PVE can discover the returned file through its normal backup inventory. Restore it through Proxmox when needed.
 
-## Scheduled uploads
-
-Version 0.12.2 adds `backups upload-latest 100 101 102`. It checks that no vzdump task is active, discovers the newest local backup for each explicit VMID, and skips matching complete cloud entries by source node, original volume/filename, and size. This assumes completed timestamped backup files are immutable; skipping does not rehash their bytes. A size conflict or duplicate newest filename on multiple stores fails for inspection. Newly selected archives must have their Proxmox log containing `Finished Backup of VM VMID` without `ERROR:`. Missing or failed latest backups fail the run rather than silently selecting an older backup. `--dry-run` shows selection without uploading. Scheduled uploads always retain local backups and do not prune cloud versions.
-
-The `systemd/` directory includes a oneshot service, hourly timer and example configuration for the `storage` node. Customize the configuration before installation. The service uploads VM backups through pve-drive, then copies the existing small host-configuration archives with rclone. It does not generate fresh host-configuration archives. Existing Proxmox backup schedules remain unchanged. Checks run around 15 minutes past each hour; if a backup job is active or another operation holds pve-drive's lock, a later timer run retries. An active service cannot overlap itself. Quota pauses use pve-drive's bounded retry policy and retain resumable staging. Check failure details with `journalctl -u pve-drive-upload.service`.
-
-After installing pve-drive, install and enable the schedule on the Proxmox node:
-
-```bash
-install -m 600 systemd/pve-drive-upload.example /etc/default/pve-drive-upload
-install -m 644 systemd/pve-drive-upload.service systemd/pve-drive-upload.timer /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now pve-drive-upload.timer
-systemctl start --no-block pve-drive-upload.service
-systemctl list-timers pve-drive-upload.timer
-```
-
 ## Metadata and layout
 
 Backup files use a separate namespace so existing VM-archive listings and older VM readers remain unchanged:
