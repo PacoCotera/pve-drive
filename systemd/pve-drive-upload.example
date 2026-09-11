@@ -1,0 +1,8 @@
+# Customize these values for the source Proxmox node.
+PVE_DRIVE_REMOTE=gdrive:pve-archive
+PVE_DRIVE_SOURCE=storage
+PVE_DRIVE_WORK_DIR=/zfsstore/backups/pve-drive
+PVE_DRIVE_MOUNT=/zfsstore/backups
+PVE_DRIVE_VMIDS="100 101 102"
+PVE_DRIVE_HOST_DIR=/zfsstore/backups/host
+PVE_DRIVE_HOST_REMOTE=gdrive:pve-archive/host-configs/storage
