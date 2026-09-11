@@ -28,3 +28,5 @@ jobs:
           sudo ./install.sh
           /usr/local/sbin/pve-drive --version
           sudo ./install.sh
+      - name: Validate upload timer and service
+        run: systemd-analyze verify systemd/pve-drive-upload.service systemd/pve-drive-upload.timer
