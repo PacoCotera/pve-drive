@@ -117,6 +117,59 @@ class LibraryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unambiguous'):
             self.upload()
 
+    def latest(self, dry_run=False):
+        self.args.vmids, self.args.dry_run = ['100'], dry_run
+        return self.lib.upload_latest()
+
+    def success_log(self, name=None):
+        name = (name or self.name).replace('.vma.zst', '.log')
+        (self.dirs['local'] / name).write_text('INFO: Finished Backup of VM 100 (00:01:00)\n')
+
+    def test_scheduled_upload_skips_existing_cloud_without_source_reads(self):
+        self.upload()
+        with patch.object(self.lib, 'upload_file', side_effect=AssertionError('duplicate upload')):
+            self.assertEqual(self.latest(), [])
+
+    def test_scheduled_upload_requires_success_log(self):
+        with self.assertRaisesRegex(ValueError, 'successful vzdump log'):
+            self.latest()
+        self.assertFalse(self.remote)
+
+    def test_scheduled_upload_selects_newest_and_retains_local(self):
+        newer = self.name.replace('2026_09_06', '2026_09_07')
+        (self.dirs['local'] / newer).write_bytes(b'new recovery point')
+        self.success_log(newer)
+        rows = self.latest()
+        self.assertEqual([r['filename'] for r in rows], [newer])
+        self.assertEqual([m['filename'] for m in self.lib.cloud()], [newer])
+        self.assertTrue((self.dirs['local'] / newer).exists())
+        self.assertEqual(self.latest(), [])
+
+    def test_scheduled_dry_run_never_uploads(self):
+        self.success_log()
+        self.assertEqual(len(self.latest(dry_run=True)), 1)
+        self.assertFalse(self.remote)
+
+    def test_scheduled_upload_rejects_cloud_size_conflict(self):
+        self.upload()
+        self.path.write_bytes(b'changed archive')
+        with self.assertRaisesRegex(ValueError, 'size conflict'):
+            self.latest()
+
+    def test_scheduled_upload_defers_while_backup_active(self):
+        self.active = True
+        with self.assertRaisesRegex(ValueError, 'active'):
+            self.latest()
+        self.assertFalse(self.remote)
+
+    def test_scheduled_upload_rejects_error_log(self):
+        self.success_log()
+        log = self.dirs['local'] / self.name.replace('.vma.zst', '.log')
+        with log.open('a') as out:
+            out.write('ERROR: backup failed\n')
+        with self.assertRaisesRegex(ValueError, 'successful vzdump log'):
+            self.latest()
+
     def test_copy_default_parts_order_metadata_and_bounded_spool(self):
         m = self.upload()
         self.assertTrue(self.path.exists())
